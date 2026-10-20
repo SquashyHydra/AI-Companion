@@ -1,0 +1,174 @@
+# Manual tests: speech input
+
+Automated tests cover the logic (`python -m pytest`). These checks need a real microphone, speakers, LM Studio running, and a person speaking. Run them after changes to speech input, the LLM client, or the voice loop.
+
+## Before you start
+
+```powershell
+cd "F:\AI Companion"
+.\.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = "src"
+python -m companion
+```
+
+- LM Studio server is running with the model in `llm.model` loaded.
+- `audio.input_device` in `config.yaml` names a WASAPI microphone (check with `/mics`).
+- Expect the first run to download the Whisper model.
+
+## 1. Continuous listening
+
+1. Start the companion. It should print `Listening. Speak anytime.`
+2. Say a full sentence, then pause for about a second.
+3. Expected: `Heard: "..."` appears with your sentence, then a reply streams in.
+4. Say a second sentence without pressing anything.
+5. Expected: the second sentence is also heard and answered. No Enter is needed.
+
+Pass: both sentences are transcribed and answered in order, with no keypress.
+
+## 2. Streaming replies
+
+1. Ask for a longer answer, for example "Explain how a rainbow forms in about five sentences."
+2. Expected: text appears word by word while the model is still generating, not all at once at the end.
+3. Expected: no `<think>` text is shown.
+
+Pass: text streams, and the final text has no thinking block.
+
+## 3. Barge-in
+
+1. Ask for a long answer (as in check 2).
+2. While the reply is streaming, speak clearly for about one second.
+3. Expected: the reply stops, `(interrupted)` is shown, and your new speech is heard and answered.
+4. Expected: a short cough or click does not stop the reply (it is below `min_speech_ms` and `barge_in_ms`).
+5. Ask a follow-up such as "what did you just say?" Expected: the model knows the reply was cut off.
+
+Pass: sustained speech stops the reply within about half a second. A cough does not.
+
+## 4. Low-confidence display
+
+1. Mumble, or speak quietly from a distance.
+2. Expected: a transcript printed as `Heard (low confidence): "..."` when the average log-probability is below `low_confidence_logprob` (default -1.0).
+3. Expected: the text is still sent to the model.
+4. Optional: lower `low_confidence_logprob` to `-0.5` and confirm more transcripts are flagged. Restore the setting afterwards.
+
+Pass: quiet or unclear speech is flagged. Clear speech is not.
+
+## 5. Debug audio saving
+
+1. Set `audio.save_utterances: true` in `config.yaml`. Restart.
+2. Say one sentence.
+3. Expected: a new `.wav` file appears in `logs/utterances/`. Play it back: your voice is clear, at 16 kHz mono, and includes a little silence before and after.
+4. Expected: `logs/transcripts.jsonl` has a new line with the same text.
+5. Set `save_utterances: false` again and restart.
+
+Pass: the WAV plays correctly and matches what was heard. No new WAV files are written when the setting is false.
+
+## 6. Microphone list shows WASAPI only
+
+1. Type `/mics`.
+2. Expected: every entry is a WASAPI device. No MME, DirectSound, or WDM-KS entries appear. Each physical microphone appears once.
+3. Expected: the default input device is marked, and the numbers match `audio.input_device` where it is set.
+
+Pass: only WASAPI devices, with no duplicates.
+
+## 7. Clean Ctrl+C and /exit
+
+1. With the companion listening, press Ctrl+C.
+2. Expected: the program exits within a second or two, with no traceback and no hang. The prompt returns.
+3. Start again. Start a reply, then press Ctrl+C during it. Expected: same clean exit.
+4. Start again, type `/exit`. Expected: clean exit.
+5. Start again, press Enter (pause), then Enter (resume), then Ctrl+C. Expected: clean exit.
+
+Pass: all four exits are clean and the terminal is usable afterwards.
+
+## 8. Audio diagnostic and playback
+
+1. Run `python -m companion.diagnose_audio` (with `$env:PYTHONPATH = "src"`).
+2. Expected: the WASAPI device list is shown and the configured device is marked `*`.
+3. When it says `Speak now.`, speak a normal sentence for the full 5 seconds.
+4. Expected: `Peak` and `Average level` are printed, and a `Saved:` path under `logs/diagnostics/`.
+5. Play the WAV back. Expected: your voice is clear, with no crackle or distortion.
+6. Expected: no `Warning:` line. Near silence means the wrong device or a muted mic. Clipping means lower the mic gain.
+
+Pass: the WAV plays back your sentence clearly, and the levels are not near silence or clipping.
+
+## 9. First word is not clipped
+
+1. Start the companion in continuous mode.
+2. Speak a sentence that starts with a quiet word (for example "Hmm, what time is it?") after a short pause.
+3. Expected: `Heard: "..."` begins with the first word. The first word is not missing or cut in half.
+4. Optional: enable `audio.save_utterances` and check the start of the WAV. It should include a little silence before the speech.
+
+Pass: the first word is present in the transcript on three tries out of three.
+
+## 10. Confirmation: yes, no, timeout, Enter, Ctrl+C
+
+The companion has no `delete_note` tool. Use `clear_notes`, which requires confirmation. Ask it to clear notes (for example "clear all my notes").
+
+1. **Yes:** press `y`. Expected: `Allowed.` and the tool runs. Note the result.
+2. **No:** repeat the request, then press `n`. Expected: `Declined.` and the notes are unchanged.
+3. **Timeout:** repeat the request and wait without answering for `input.confirm_timeout_s` seconds (default 30). Expected: the request is declined, and `companion.log` has a line `confirmation timed out after 30 s; declined`.
+4. **Enter does nothing:** repeat the request and press Enter. Expected: no pause, no decline, and no echoed text. The question is still waiting. Press `n` to finish.
+5. **Ctrl+C cancels:** repeat the request and press Ctrl+C. Expected: `Confirmation cancelled. Declined.` The companion keeps running. Ask a normal question to confirm.
+6. **Double Ctrl+C quits:** repeat the request and press Ctrl+C once. Expected: `Confirmation cancelled. Declined.` and the companion keeps running. Press Ctrl+C again within 2 seconds. Expected: the program exits within about a second. It does not wait for the timeout.
+
+Pass: each path shows the right result, and every decline or answer is logged in `companion.log`.
+
+## 11. Speech output (Phase 4, Chatterbox-Turbo, Chatterbox-Nano, Piper)
+
+Setup: follow the README "Speech output" section for both Piper and the `.venv-tts` Chatterbox environment (pinned in `requirements-tts.txt`). Run `python -m companion.diagnose_tts --engine chatterbox_turbo` first and confirm it plays the test sentence with a laugh. Then run it with `--engine chatterbox_nano --device cuda` and with `--engine piper` to confirm the other voices.
+
+1. **Headphones, first sentence:** start the companion in continuous mode with `output_mode: headphones`. Ask a question with a long answer. Expected: speech starts after the first sentence finishes streaming, not after the whole reply.
+2. **No self-reading:** the reply is not spoken as Markdown symbols, code, or URLs, and no `<think>` text is spoken.
+3. **Voice tags:** ask something that invites a reaction (for example, a joke). Expected: a real laugh or chuckle is heard where the tag was, and the tag text (`laugh`, brackets) is never spoken. Unknown tags such as `[banana]` are silent and do not break the sentence.
+4. **Tag display:** with `display.show_voice_tags: true`, the tag shows on screen. With `false`, it is hidden on screen too.
+5. **Barge-in:** while a reply is speaking, speak for `barge_in_ms`. Expected: speech stops promptly, `(stopped speaking)` is printed, and the next answer shows the reply truncated to the spoken part followed by `[interrupted]` (ask "what did you just say?" to check). Speech that was already synthesized during the interruption must not play late.
+6. **Barge-in mid-sentence:** interrupt while a long sentence with a tag is being spoken. Expected: no late audio from that sentence after the stop.
+7. **Speakers, no self-interrupt:** set `output_mode: speakers`, then ask a question. Expected: the companion speaks the whole reply without stopping itself, and barge-in does not fire from its own voice.
+8. **Speakers tail:** after the reply ends, wait `speakers_tail_ms` before speaking. Expected: your first word is captured, not clipped.
+9. **Fallback to Piper:** set `tts.chatterbox.python` to a path that does not exist, then start the companion. Expected: a message says Chatterbox is unavailable and falls back to Piper, replies are spoken with Piper, and tags are removed from the text. Restore the setting afterwards.
+10. **Chatterbox autostart and shutdown:** start the companion with Chatterbox. Expected: the server starts on port 8765 and reports ready within about 40 s. After `/exit`, no `chatterbox_server` python process remains (check in Task Manager or with `Get-CimInstance Win32_Process`).
+11. **Ctrl+C during speech:** press Ctrl+C once while it speaks. Expected: speech stops and the companion keeps running.
+12. **Text and push-to-talk modes:** set `input.mode: text`. Expected: replies are printed and not spoken.
+13. **Latency:** note the time from your question to the first audible word, over three questions, for both Chatterbox and Piper (set `tts.engine` to switch). Record the numbers in the table below.
+
+14. **Engine comparison:** with the companion stopped, run `python -m companion.diagnose_tts --compare`. Expected: four engine and device rows print (Turbo cuda, Nano cuda, Nano cpu, Piper cpu), each with a short, long, and `[laugh]` WAV in `logs/diagnostics`. Listen to the Turbo and Nano cuda `laugh` WAVs and confirm the laugh is audible and the tag word is not spoken.
+15. **Nano engine:** set `tts.engine: chatterbox_nano` and repeat items 1 and 3. Expected: same behavior as Turbo, with the same tags. Restore `chatterbox_turbo` afterwards.
+16. **Offline start:** with `tts.offline: true` and both Chatterbox models cached, disconnect from the network and start the companion with Chatterbox. Expected: the server reports ready within the usual load time, with no network errors.
+17. **Speed warning:** set `audio.speech_speed: 0.8` with a Chatterbox engine. Expected: a startup warning says the setting applies to Piper only. Restore `1.0` afterwards.
+
+Pass: items 1 to 17 behave as described, and latency is recorded for both engines.
+
+Measured on this machine (automated, `diagnose_tts --compare`, RTF = synthesis time / audio length, lower is faster; GPU MB is the server's reported peak):
+
+| Engine | Device | Load s | Short synth s / audio s / RTF | Long synth s / audio s / RTF | Laugh synth s / audio s / RTF | GPU MB |
+|---|---|---|---|---|---|---|
+| chatterbox_turbo | cuda | 22.80 | 1.42 / 3.04 / 0.47 | 4.07 / 9.08 / 0.45 | 1.37 / 2.96 / 0.46 | 2937 |
+| chatterbox_nano | cuda | 19.33 | 0.70 / 2.16 / 0.33 | 2.14 / 8.00 / 0.27 | 0.95 / 3.28 / 0.29 | 1971 |
+| chatterbox_nano | cpu | 18.80 | 3.09 / 2.00 / 1.54 | 8.92 / 7.44 / 1.20 | 4.59 / 3.60 / 1.27 | n/a |
+| piper | cpu | 3.23 | 0.11 / 2.18 / 0.05 | 0.29 / 8.09 / 0.04 | 0.10 / 2.64 / 0.04 | n/a |
+
+Live server checks (not by ear), on the pinned commit, for both Turbo and Nano on cuda: `/health` returns status `ready` with the same 19 tags (advertisement through whispering). `/synthesize` at generation 5 returns 200 with float32 audio. After `/cancel` at generation 6, a generation 5 request returns 409 ("generation 5 was cancelled by 6"), and generation 6 returns 200. A clean venv built from `requirements-tts.txt` plus the pinned chatterbox commit gives the same Turbo results.
+
+Not yet checked by ear: whether the `laugh` tag is audible in Nano output. Item 14 covers it.
+
+
+## Other modes (regression)
+
+- `input.mode: push_to_talk`: Enter starts a recording, Enter stops it, and the transcript is sent.
+- `input.mode: text`: no microphone is opened, and typed chat works.
+- Confirmation in text mode: ask the model to clear notes. Expected: it asks in the terminal; answering "no" or "yes" works. This mode still uses the blocking prompt, so there is no timeout.
+
+## Recording results
+
+| Check | Date | Result | Notes |
+|---|---|---|---|
+| 1. Continuous listening | | | |
+| 2. Streaming replies | | | |
+| 3. Barge-in | | | |
+| 4. Low-confidence display | | | |
+| 5. Debug audio saving | | | |
+| 6. /mics WASAPI only | | | |
+| 7. Clean Ctrl+C and /exit | | | |
+| 8. Audio diagnostic and playback | | | |
+| 9. First word is not clipped | | | |
+| 10. Confirmation paths | | | |

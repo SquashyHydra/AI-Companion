@@ -1,0 +1,129 @@
+# PC Companion configuration.
+# Any value below can be overridden with an environment variable (see README).
+
+llm:
+  # LM Studio default. Any OpenAI-compatible server works.
+  base_url: http://localhost:1234/v1
+  # Use the identifier LM Studio shows for your loaded model.
+  model: qwen3-8b
+  # Local servers usually ignore the key, but the client requires one.
+  api_key: lm-studio
+  temperature: 0.7
+  timeout_s: 60
+  # Maximum tool-call round trips for a single user message.
+  max_tool_rounds: 5
+
+tools:
+  # Relative paths are resolved from the project root.
+  notes_dir: data/notes
+  # JSON allowlist of apps the companion may open (friendly name -> path or steam:// URL).
+  apps_file: data/apps.json
+
+input:
+  # continuous: always listening, hands-free, with barge-in.
+  # push_to_talk: press Enter to start and stop each recording.
+  # text: typing only.
+  mode: continuous
+  # Seconds to answer a confirmation (yes or no). No answer counts as no. Range 5 to 300.
+  confirm_timeout_s: 30
+
+audio:
+  # Speech input. Set to false for text-only chat (same as input.mode: text).
+  enabled: true
+  # null uses the default microphone. Or a device number from /mics, or part of its name.
+  # 50 (SteelSeries Sonar - Microphone) hears the reply playing on Sonar Chat; 48 did not in a test.
+  input_device: 50
+  # faster-whisper model: tiny, base, small, medium, large-v3. Downloaded on first use.
+  whisper_model: small
+  # cuda uses the GPU. cpu works without one.
+  whisper_device: cuda
+  # float16 for cuda. Use int8 for cpu.
+  whisper_compute_type: float16
+  # Language code such as en, or null to auto-detect.
+  language: en
+  # Silero VAD speech threshold, 0 to 1. Higher ignores more quiet sounds.
+  # Silero is the only VAD. faster-whisper's built-in vad_filter is off.
+  vad_threshold: 0.8
+  # Utterances shorter than this many seconds are ignored (push-to-talk).
+  min_seconds: 0.3
+
+  # Continuous listening settings.
+  # Audio kept from before the detected start of speech, so first words are not cut off.
+  pre_roll_ms: 400
+  # Speech shorter than this is treated as a cough or click and ignored.
+  min_speech_ms: 250
+  # Silence that ends an utterance. Lower is faster but cuts off pauses mid-sentence.
+  end_silence_ms: 700
+  # Longest single utterance before it is cut and sent.
+  max_utterance_s: 30
+  # Speech for this long while the companion is talking or thinking interrupts it.
+  barge_in_ms: 400
+
+  # Transcription settings.
+  # Beam search width. Higher is slower and sometimes more accurate.
+  beam_size: 5
+  # Words or phrases Whisper should expect (names, product words, jargon).
+  vocabulary: []
+  # Also add the names in data/apps.json to the vocabulary.
+  include_app_names: true
+  # Use the vocabulary as hotwords too. Can make Whisper over-insist on these words.
+  use_hotwords: false
+  # Average log-probability below this marks a transcript as low confidence.
+  low_confidence_logprob: -1.0
+
+  # Debug: save each utterance as a WAV file in utterance_dir.
+  save_utterances: false
+  utterance_dir: logs/utterances
+
+  # Speech output (voice mode only; typed and push-to-talk modes stay silent).
+  # Speak replies aloud, sentence by sentence. The engine is chosen in the tts section below.
+  speak_replies: true
+  # headphones: barge-in works hands-free (you can talk over the reply to interrupt it).
+  # speakers: the mic is muted while the reply plays (plus the tail below), so barge-in is off.
+  output_mode: headphones
+  # Output device: empty for the Windows default, a number from the diagnostic, or part of a name.
+  # WASAPI outputs only. Run: python -m companion.diagnose_tts
+  output_device:
+  # Piper voice model (.onnx), used when tts.engine is piper or Chatterbox cannot start.
+  # Its .json config must sit next to it.
+  voice_path: data/voices/en_US-lessac-medium.onnx
+  # Piper only: 0.5 to 2.0. 1.0 is normal speed. Chatterbox engines have no speed control and ignore it.
+  speech_speed: 1.0
+  # speakers mode only: keep the mic muted this many ms after the last sample, for room echo.
+  speakers_tail_ms: 400
+
+tts:
+  # chatterbox_turbo: Resemble AI's Chatterbox-Turbo (350M, English). Renders [laugh], [chuckle],
+  #   [cough] and other tags. Runs in a separate process from .venv-tts.
+  # chatterbox_nano: Resemble AI's Chatterbox-Nano (110M, English). Smaller and faster to load.
+  #   Renders the tags its model lists (read from the model at startup).
+  # piper: Piper voice from audio.voice_path. CPU only, no voice tags.
+  # If a Chatterbox engine cannot start, the app falls back to Piper and says so.
+  engine: chatterbox_nano
+  # cuda uses the GPU. cpu works without one but is much slower. Applies to Chatterbox engines.
+  device: cuda
+  # true: the Chatterbox server uses only the local model cache (HF_HUB_OFFLINE=1).
+  # The first run needs a download, so set this to false once, then back to true.
+  offline: true
+  # Words of the first sentence before speech starts. The first chunk is cut early at a clause
+  # boundary or after this many words. 0 turns the early cut off.
+  first_chunk_words: 7
+  chatterbox:
+    # Python of the .venv-tts environment that runs the server (relative to the project root).
+    python: .venv-tts/Scripts/python.exe
+    # Localhost only (127.0.0.1 or localhost).
+    host: 127.0.0.1
+    port: 8765
+    # Empty uses the built-in voice. Or a clip of at least 5 seconds (WAV), relative to the project root.
+    voice_reference:
+    # true: the companion starts and stops the server itself.
+    # false: run the server yourself (see README) and set host and port to match.
+    autostart: true
+    # Maximum seconds to wait for the model to load (the first run also downloads it).
+    startup_timeout_s: 300
+    # Maximum seconds for one sentence to render.
+    request_timeout_s: 60
+
+display:
+  # true: show voice tags such as [laugh] on screen. false: hide the tags that the voice renders.
+  show_voice_tags: true

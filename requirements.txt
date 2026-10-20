@@ -1,0 +1,7 @@
+openai==3.35.1
+pydantic>=2.6
+PyYAML>=6.0
+sounddevice>=0.5
+numpy>=2.0
+faster-whisper>=1.2
+silero-vad>=6.2
