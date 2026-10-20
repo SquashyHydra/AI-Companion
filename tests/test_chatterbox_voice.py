@@ -14,7 +14,7 @@ import yaml
 
 from companion.audio import chatterbox_server
 from companion.audio.errors import SpeechError, SupersededError
-from companion.audio.tts import load_voice
+from companion.audio.tts import ResilientSynthesizer, load_voice
 from companion.audio.tts_chatterbox import ChatterboxSynthesizer
 from companion.config import PROJECT_ROOT, ChatterboxConfig, ConfigError, TtsConfig, load_config
 from companion.voice.tags import TagDisplayFilter, normalize_tag, tags_from_vocabulary
@@ -160,7 +160,8 @@ def test_load_voice_uses_chatterbox_when_it_loads() -> None:
         make_chatterbox=lambda _tts: ok,  # type: ignore[arg-type,return-value]
         make_piper=lambda _audio: pytest.fail("Piper must not load"),  # type: ignore[arg-type,return-value]
     )
-    assert voice is ok
+    assert isinstance(voice, ResilientSynthesizer)
+    assert voice._primary is ok  # noqa: SLF001
 
 
 def test_load_voice_piper_setting_skips_chatterbox() -> None:
@@ -453,9 +454,9 @@ def _config_file(tmp_path: Path, **tts: object) -> Path:
     return path
 
 
-def test_project_config_uses_turbo_on_cuda_offline_with_early_first_chunk() -> None:
+def test_project_config_uses_nano_on_cuda_offline_with_early_first_chunk() -> None:
     tts = load_config(PROJECT_ROOT / "config.yaml", environ={}).tts
-    assert tts.engine == "chatterbox_turbo"
+    assert tts.engine == "chatterbox_nano"
     assert tts.device == "cuda"
     assert tts.offline is True
     assert tts.first_chunk_words == 7

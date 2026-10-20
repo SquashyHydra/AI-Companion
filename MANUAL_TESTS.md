@@ -135,8 +135,9 @@ Setup: follow the README "Speech output" section for both Piper and the `.venv-t
 15. **Nano engine:** set `tts.engine: chatterbox_nano` and repeat items 1 and 3. Expected: same behavior as Turbo, with the same tags. Restore `chatterbox_turbo` afterwards.
 16. **Offline start:** with `tts.offline: true` and both Chatterbox models cached, disconnect from the network and start the companion with Chatterbox. Expected: the server reports ready within the usual load time, with no network errors.
 17. **Speed warning:** set `audio.speech_speed: 0.8` with a Chatterbox engine. Expected: a startup warning says the setting applies to Piper only. Restore `1.0` afterwards.
+18. **Chatterbox restart and Piper fallback:** with the companion running on Chatterbox, stop the Chatterbox server (end the `chatterbox_server` python process in Task Manager) and ask a question. Expected: a notice says Chatterbox is restarting; it restarts once and the reply is spoken. Stop it again and ask another question. Expected: a notice says it is switching to the Piper voice, the reply is spoken with Piper, and later replies stay on Piper for the session. Piper needs its voice file in `audio.voice_path`.
 
-Pass: items 1 to 17 behave as described, and latency is recorded for both engines.
+Pass: items 1 to 18 behave as described, and latency is recorded for both engines.
 
 Measured on this machine (automated, `diagnose_tts --compare`, RTF = synthesis time / audio length, lower is faster; GPU MB is the server's reported peak):
 
@@ -151,6 +152,29 @@ Live server checks (not by ear), on the pinned commit, for both Turbo and Nano o
 
 Not yet checked by ear: whether the `laugh` tag is audible in Nano output. Item 14 covers it.
 
+
+## 12. Conversation, persona, and memory (Phase 5)
+
+Setup: LM Studio running with the model loaded. Start the companion in text mode (`input.mode: text`) so the checks are easy to read.
+
+- **Persona:** edit [data/persona.md](data/persona.md) to a new name, type `/new`, and ask the companion its name. Expected: it uses the new persona. Restore the file afterward.
+- **Remember and recall:** say "remember that my dog is called Biscuit". Expected: a confirmation and a saved memory. Start `/new`, then ask "what is my dog called?". Expected: the answer names Biscuit.
+- **Secret refusal:** say "remember my password is hunter2". Expected: refused; nothing is saved.
+- **List and forget:** ask to list memories. Ask to forget "dog". Expected: a confirmation prompt; answer no, then yes; the memory is gone.
+- **Status:** type `/status`. Expected: model, context use, saved memory count, and the log path after the first reply.
+- **Log:** check that a file in `logs/conversations/` contains your turns and the replies.
+- **Server down:** stop LM Studio's server and send a message. Expected: a short "cannot reach" message after a few seconds, no crash. Restart the server; the next message works and the earlier history is still there.
+- **Long conversation:** lower `llm.compact_at` to 0.3 for this check. Send several long messages. Expected: no error; `/status` still works; the reply quality stays reasonable.
+- **Voice:** in continuous mode, say the remember and recall phrases. Expected: the same results as in text.
+- **Remember in two messages:** send "remember" alone. Expected: the reply asks what to remember. Send "my car is a blue Honda" next. Expected: it is saved, and the reply confirms only after the save. Check with `list_memories` that the text is there.
+- **Remember the previous message:** send "my sister lives in Leeds", then "remember this". Expected: the previous message is saved.
+- **Auto-save:** with `memory.auto_save: true`, state a fact about yourself ("I have two cats") and do not ask to remember it. Expected: `list_memories` shows it with source `auto`. Set `memory.auto_save: false`, repeat, and expect nothing new to be saved.
+- **Auto-save skips questions:** ask "do I have any cats?". Expected: nothing new is saved.
+- **Forget that:** after an auto-save, say "forget that". Expected: the latest auto-saved memory is deleted at once, with no read-back.
+- **Forget read-back:** say "forget cats". Expected: the reply reads back the matching text and asks yes or no. Answer "yes" to delete it; repeat and answer "no" to keep it. Any other reply is handled as a new message, and nothing is deleted.
+- **Synonym recall:** save "I work as a nurse in Leeds". In a new conversation (`/new`), ask "what is my job?". Expected: the nurse memory is recalled through the semantic match, even though the words "job" and "nurse" do not match.
+- **Embeddings off:** set `memory.embeddings: false`, restart, and repeat the synonym check. Expected: no semantic match; keyword recall still works.
+- **Embedding model missing:** set `memory.embedding_cache` to an empty folder without internet. Expected: a notice says the model is unavailable, and keyword recall still works.
 
 ## Other modes (regression)
 

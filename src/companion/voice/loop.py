@@ -26,7 +26,8 @@ from companion.audio.stt import Transcription, make_transcriber
 from companion.audio.tts import load_voice
 from companion.audio.vad import SileroFrameDetector
 from companion.config import PROJECT_ROOT, AppConfig, AudioConfig
-from companion.llm.client import INTERRUPTED_MARK, LLMClient, LLMError, Messages, TurnOutcome
+from companion.conversation import Conversation
+from companion.llm.client import INTERRUPTED_MARK, LOW_CONFIDENCE_NOTE, LLMClient, LLMError, Messages, TurnOutcome
 from companion.tools.registry import ToolRegistry
 from companion.voice.confirm import EventConfirmer
 from companion.voice.keys import KeyReader, LineEditor
@@ -36,6 +37,7 @@ from companion.voice.machine import (
     Event,
     ListenMachine,
     MicFailed,
+    MicReady,
     Notice,
     Print,
     Quit,
@@ -46,11 +48,13 @@ from companion.voice.machine import (
     ResolveConfirmation,
     RunCommand,
     Shutdown,
+    ShowStatus,
     StartMic,
     StartReply,
     Stream,
     StopMic,
     StopSpeech,
+    Tick,
     Transcribe,
     Transcript,
 )
@@ -64,7 +68,8 @@ TICK_S = 0.05
 JOIN_S = 1.0
 """How long shutdown waits for a worker thread. Workers are daemon threads, so this is only a courtesy."""
 
-StreamFn = Callable[[Messages, str, threading.Event, Callable[[str], None]], TurnOutcome]
+StreamFn = Callable[..., TurnOutcome]
+"""(history, text, cancel, on_delta, *, confirm_note=None) -> TurnOutcome."""
 TranscribeFn = Callable[[np.ndarray], Transcription]
 
 
@@ -97,6 +102,7 @@ class VoiceLoop:
         stop: threading.Event | None = None,
         speech: SpeechOut | None = None,
         show_voice_tags: bool = True,
+        conversation: Conversation | None = None,
     ) -> None:
         self._machine = machine
         self._pipeline = pipeline
@@ -104,6 +110,7 @@ class VoiceLoop:
         self._stream = stream
         self._run_command = run_command
         self._new_history = new_history
+        self._conversation = conversation
         self._keys = keys
         self._editor = editor
         self._events = events
@@ -146,6 +153,7 @@ class VoiceLoop:
                 try:
                     event = self._events.get(timeout=self._tick_s)
                 except queue.Empty:
+                    self._handle(Tick())
                     continue
                 self._handle(event)
         except KeyboardInterrupt:
@@ -157,7 +165,11 @@ class VoiceLoop:
     # ----- dispatch -----
 
     def _handle(self, event: Event) -> None:
-        self._dispatch(self._machine.handle(event))
+        try:
+            self._dispatch(self._machine.handle(event))
+        except Exception:
+            logger.exception("voice loop error while handling %r", event)
+            self._print("Something went wrong just now. The details are in the log. Carrying on.")
 
     def _dispatch(self, actions: list) -> None:
         for action in actions:
@@ -171,16 +183,18 @@ class VoiceLoop:
                 self._pipeline.stop()
             case Transcribe(audio=audio):
                 self._spawn(self._transcribe_worker, audio)
-            case StartReply(turn=turn, text=text):
-                self._start_reply(turn, text)
+            case StartReply(turn=turn, text=text, low_confidence=low, unsure=unsure):
+                self._start_reply(turn, text, low, unsure)
             case CancelReply():
                 if self._cancel is not None:
                     self._cancel.set()
                 self._stop_speech()
             case StopSpeech():
                 self._stop_speech()
-            case Notice(text=text):
+            case Notice(text=text, spoken=spoken):
                 self._print(text)
+                if spoken and self._speech is not None:
+                    self._speech.feed(spoken)
             case Stream(text=text):
                 self._write(self._tags.feed(text))
                 self._line_open = True
@@ -192,12 +206,20 @@ class VoiceLoop:
             case ResetHistory():
                 self._history = self._new_history()
                 self._print("Conversation cleared.")
+            case ShowStatus():
+                if self._conversation is not None:
+                    self._print(self._conversation.status(self._history))
+                else:
+                    self._print("No status available.")
             case RunCommand(text=text):
                 output = self._run_command(text)
                 if output:
                     self._print(output)
-            case Print(text=text):
+            case Print(text=text, spoken=spoken):
                 self._print(text)
+                if spoken and self._speech is not None:
+                    self._speech.feed(spoken)
+                    self._speech.finish()
             case ResolveConfirmation(answer=answer):
                 self._answers.put(answer)
             case Shutdown():
@@ -212,24 +234,32 @@ class VoiceLoop:
             self._pipeline.start()
         except SpeechError as exc:
             self._events.put(MicFailed(str(exc)))
+            return
         except Exception as exc:
             logger.exception("microphone failed to start")
             self._events.put(MicFailed(str(exc) or type(exc).__name__))
+            return
+        self._events.put(MicReady())
 
-    def _start_reply(self, turn: int, text: str) -> None:
+    def _start_reply(
+        self, turn: int, text: str, low_confidence: bool = False, unsure: bool = False
+    ) -> None:
         self._stop_speech()
         self._cut = None
         self._reply_in_history = False
         self._tags.flush()
         if self._speech is not None:
             self._speech.begin_reply()
+        if self._conversation is not None:
+            self._history = self._conversation.apply(self._history)
         cancel = threading.Event()
         self._cancel = cancel
         self._streamed = False
         self._editor.clear_line()
         self._write("Companion> ")
         self._line_open = True
-        self._spawn(self._reply_worker, turn, text, self._history, cancel)
+        note = LOW_CONFIDENCE_NOTE if low_confidence else None
+        self._spawn(self._reply_worker, turn, text, self._history, cancel, note, unsure)
 
     def _apply(self, outcome: TurnOutcome) -> None:
         self._history = outcome.messages
@@ -249,6 +279,8 @@ class VoiceLoop:
                 self._write("(no reply)\n")
             else:
                 self._write("\n")
+            if self._conversation is not None:
+                self._conversation.after_turn(self._history)
         self._line_open = False
         self._cancel = None
         self._editor.redraw()
@@ -311,12 +343,18 @@ class VoiceLoop:
         text: str,
         history: Messages,
         cancel: threading.Event,
+        confirm_note: str | None = None,
+        unsure: bool = False,
     ) -> None:
         def on_delta(chunk: str) -> None:
             self._events.put(ReplyDelta(turn, chunk))
 
+        # Only pass optional keywords when set, so simple stream functions keep working.
+        extra: dict[str, object] = {"confirm_note": confirm_note} if confirm_note else {}
+        if unsure:
+            extra["low_confidence"] = True
         try:
-            outcome = self._stream(history, text, cancel, on_delta)
+            outcome = self._stream(history, text, cancel, on_delta, **extra)
         except LLMError as exc:
             self._events.put(ReplyFailed(turn, str(exc)))
             return
@@ -345,6 +383,7 @@ def build_voice_loop(
     run_command: Callable[[str], str],
     new_history: Callable[[], Messages],
     notify: Callable[[str], None] = print,
+    conversation: Conversation | None = None,
 ) -> VoiceLoop:
     """Load the speech models and build the loop.
 
@@ -413,13 +452,31 @@ def build_voice_loop(
         text: str,
         cancel: threading.Event,
         on_delta: Callable[[str], None],
+        *,
+        confirm_note: str | None = None,
+        low_confidence: bool = False,
     ) -> TurnOutcome:
-        return llm.stream_turn(history, text, cancel=cancel, on_delta=on_delta)
+        if conversation is not None:
+            return conversation.stream(
+                history,
+                text,
+                cancel,
+                on_delta,
+                confirm_note=confirm_note,
+                low_confidence=low_confidence,
+            )
+        return llm.stream_turn(
+            history, text, cancel=cancel, on_delta=on_delta, confirm_note=confirm_note
+        )
+
+    if conversation is not None:
+        conversation.set_announce(lambda text, spoken: events.put(Notice(text, spoken=spoken)))
 
     return VoiceLoop(
         machine=ListenMachine(
             barge_in_ms=audio.barge_in_ms,
             speech_busy=(lambda: speech.speaking()) if speech is not None else None,
+            confirm_low_confidence=config.input.confirm_low_confidence_tools,
         ),
         pipeline=pipeline,
         transcribe=transcriber.transcribe_detailed,
@@ -436,6 +493,7 @@ def build_voice_loop(
         stop=stop,
         speech=speech,
         show_voice_tags=config.display.show_voice_tags,
+        conversation=conversation,
     )
 
 
@@ -447,7 +505,12 @@ def _build_speech(
     Raises SpeechError if no voice can be loaded.
     """
     audio = config.audio
-    synth = load_voice(config.tts, audio, notify=notify)
+    synth = load_voice(
+        config.tts,
+        audio,
+        notify=notify,
+        notice=lambda text, spoken=None: events.put(Notice(text, spoken=spoken)),
+    )
     player = SpeakerPlayer(synth.sample_rate, device=resolve_output_device(audio.output_device))
     speech = SpeechOut(
         synth,

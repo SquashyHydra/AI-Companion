@@ -12,6 +12,46 @@ llm:
   timeout_s: 60
   # Maximum tool-call round trips for a single user message.
   max_tool_rounds: 5
+  # Context window in tokens. 0 reads the loaded size from LM Studio (falls back to 8192).
+  context_tokens: 0
+  # Summarize older turns once history passes this share of the window (0.3 to 0.95).
+  compact_at: 0.7
+  # Recent turns always kept word for word when older turns are summarized.
+  keep_recent_turns: 4
+  # Characters kept from a tool result before it is sent back to the model.
+  max_tool_result_chars: 2000
+  # Upper limit on the summary text that replaces older turns.
+  max_summary_chars: 1500
+  # Retries when the LLM server is unreachable, with a growing delay in seconds.
+  connect_retries: 2
+  retry_delay_s: 1.0
+
+# Persona text is read from this file at the start of each conversation.
+conversation:
+  persona_file: data/persona.md
+  # One plain-text transcript per conversation under logs/conversations/.
+  log_enabled: true
+  log_dir: logs/conversations
+
+# Long-term memory: remember, recall, list_memories, and forget tools.
+memory:
+  enabled: true
+  db_path: data/memory/memories.sqlite
+  # How many matching memories are shown to the model for each turn.
+  max_in_prompt: 5
+  # Longest memory text accepted by remember.
+  max_chars: 300
+  # Save durable facts from finished turns in the background. Facts are listed as "[noted: ...]".
+  auto_save: true
+  # Also speak the "[noted: ...]" line for automatic saves.
+  announce_auto: false
+  # Synonym recall with a small CPU embedding model (about 70 MB, downloaded on first use).
+  # When false, or when the model cannot load, recall uses keywords only.
+  embeddings: true
+  embedding_model: BAAI/bge-small-en-v1.5
+  embedding_cache: data/models
+  # Cosine similarity a memory needs to count as related (0 to 1).
+  semantic_min_score: 0.55
 
 tools:
   # Relative paths are resolved from the project root.
@@ -34,7 +74,7 @@ audio:
   # 50 (SteelSeries Sonar - Microphone) hears the reply playing on Sonar Chat; 48 did not in a test.
   input_device: 50
   # faster-whisper model: tiny, base, small, medium, large-v3. Downloaded on first use.
-  whisper_model: small
+  whisper_model: medium
   # cuda uses the GPU. cpu works without one.
   whisper_device: cuda
   # float16 for cuda. Use int8 for cpu.

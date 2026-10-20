@@ -27,6 +27,14 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ARG_LINE_RE = re.compile(r"^\s+(\w+)\s*:\s*(.+)$")
 
 
+@dataclass(frozen=True)
+class ToolResult:
+    """Outcome of one tool call. status is ok, invalid, unknown, declined, timeout, busy or failed."""
+
+    status: str
+    text: str
+
+
 @dataclass(eq=False)
 class Tool:
     name: str
@@ -113,14 +121,36 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.schema() for tool in self._tools.values()]
 
-    def execute(self, name: str, arguments: str | dict[str, Any] | None) -> str:
+    def execute(
+        self,
+        name: str,
+        arguments: str | dict[str, Any] | None,
+        *,
+        confirm_note: str | None = None,
+    ) -> str:
         """Validate and run a tool call. Always returns text, including errors. Every call is audited."""
-        started = time.monotonic()
-        status, text = self._run(name, arguments)
-        _audit(name, arguments, status, text, time.monotonic() - started)
-        return text
+        return self.call(name, arguments, confirm_note=confirm_note).text
 
-    def _run(self, name: str, arguments: str | dict[str, Any] | None) -> tuple[str, str]:
+    def call(
+        self,
+        name: str,
+        arguments: str | dict[str, Any] | None,
+        *,
+        confirm_note: str | None = None,
+    ) -> ToolResult:
+        """Like execute, but also returns the status so callers can count bad calls.
+
+        confirm_note, when given, is shown in front of the confirmation question and forces a
+        yes before the tool runs (used for speech that was heard with low confidence).
+        """
+        started = time.monotonic()
+        status, text = self._run(name, arguments, confirm_note)
+        _audit(name, arguments, status, text, time.monotonic() - started)
+        return ToolResult(status, text)
+
+    def _run(
+        self, name: str, arguments: str | dict[str, Any] | None, confirm_note: str | None = None
+    ) -> tuple[str, str]:
         tool = self._tools.get(name)
         if tool is None:
             available = ", ".join(self._tools) or "none"
@@ -136,27 +166,34 @@ class ToolRegistry:
             return "invalid", f"Error: invalid arguments for '{name}': {_summarize(exc)}"
 
         kwargs = {key: getattr(args, key) for key in tool.args_model.model_fields}
-        if tool.requires_confirmation and not self._confirmed(tool, kwargs):
+        if (tool.requires_confirmation or confirm_note) and not self._confirmed(
+            tool, kwargs, confirm_note
+        ):
             return "declined", f"Error: the user did not allow '{name}', so it was not run."
         return self._start(tool, kwargs)
 
-    def _confirmed(self, tool: Tool, kwargs: dict[str, Any]) -> bool:
-        decision = self._decide(tool, kwargs)
+    def _confirmed(self, tool: Tool, kwargs: dict[str, Any], confirm_note: str | None) -> bool:
+        shown = ", ".join(f"{key}={value!r}" for key, value in kwargs.items())
+        question = f"Allow the companion to run {tool.name}({shown})?"
+        if confirm_note:
+            question = f"{confirm_note} {question}"
+        return self._record_decision(tool.name, question)
+
+    def _record_decision(self, tool_name: str, question: str) -> bool:
+        decision = self._decide(tool_name, question)
         _write_audit(
-            {"timestamp": _now(), "tool": tool.name, "event": "confirmation", "decision": decision}
+            {"timestamp": _now(), "tool": tool_name, "event": "confirmation", "decision": decision}
         )
         return decision == "approved"
 
-    def _decide(self, tool: Tool, kwargs: dict[str, Any]) -> str:
+    def _decide(self, tool_name: str, question: str) -> str:
         if self._confirmer is None:
-            logger.warning("Tool '%s' needs confirmation but no confirmer is set", tool.name)
+            logger.warning("Tool '%s' needs confirmation but no confirmer is set", tool_name)
             return "unavailable"
-        shown = ", ".join(f"{key}={value!r}" for key, value in kwargs.items())
-        question = f"Allow the companion to run {tool.name}({shown})?"
         try:
             return "approved" if self._confirmer.confirm(question) else "declined"
         except Exception:
-            logger.warning("Confirmation for '%s' failed; treating as declined", tool.name, exc_info=True)
+            logger.warning("Confirmation for '%s' failed; treating as declined", tool_name, exc_info=True)
             return "error"
 
     def _start(self, tool: Tool, kwargs: dict[str, Any]) -> tuple[str, str]:

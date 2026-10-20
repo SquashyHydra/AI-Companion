@@ -5,3 +5,4 @@ sounddevice>=0.5
 numpy>=2.0
 faster-whisper>=1.2
 silero-vad>=6.2
+fastembed>=0.9

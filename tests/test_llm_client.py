@@ -3,6 +3,7 @@
 Uses a fake OpenAI-compatible API that returns queued streams of chunks.
 """
 
+import dataclasses
 import threading
 from types import SimpleNamespace
 
@@ -155,7 +156,9 @@ def test_too_many_tool_rounds_raises_and_leaves_history_alone():
 
 def test_connection_error_is_friendly_and_leaves_history_alone():
     error = openai.APIConnectionError(request=None)
-    client = LLMClient(_config(), _registry(), api=FakeAPI(error))
+    config = dataclasses.replace(_config(), connect_retries=2, retry_delay_s=0.0)
+    # One failure per attempt: the first try plus connect_retries.
+    client = LLMClient(config, _registry(), api=FakeAPI(error, error, error))
     messages = _history()
 
     with pytest.raises(LLMError, match="cannot reach the LLM server"):

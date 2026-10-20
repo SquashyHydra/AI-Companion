@@ -21,6 +21,9 @@ ENV_OVERRIDES: dict[str, tuple[str, str]] = {
 }
 
 
+DEFAULT_CONTEXT_TOKENS = 8192
+
+
 class ConfigError(ValueError):
     """Raised when the configuration file is missing or invalid."""
 
@@ -33,6 +36,46 @@ class LLMConfig:
     temperature: float
     timeout_s: float
     max_tool_rounds: int
+    context_tokens: int = 0
+    """Context window in tokens. 0 asks LM Studio for the loaded size, else DEFAULT_CONTEXT_TOKENS."""
+    reply_reserve_tokens: int = 1024
+    """Tokens kept free for the reply and tool results when deciding what history to send."""
+    compact_at: float = 0.7
+    """Share of the context window that triggers a background summary of older turns."""
+    keep_recent_turns: int = 4
+    """Recent user turns that are always sent word for word and never summarized."""
+    max_tool_result_chars: int = 2000
+    max_summary_chars: int = 1500
+    connect_retries: int = 2
+    """Retries when the LLM server is unreachable before any reply text has arrived."""
+    retry_delay_s: float = 1.0
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    """Long-term facts the user asks the companion to remember."""
+
+    enabled: bool = True
+    db_path: Path = PROJECT_ROOT / "data" / "memory" / "memories.sqlite"
+    max_in_prompt: int = 5
+    max_chars: int = 300
+    auto_save: bool = True
+    """Save durable facts from each finished turn in the background (no tool call needed)."""
+    announce_auto: bool = False
+    """Also speak the "[noted: ...]" line for automatic saves. The line is always printed."""
+    embeddings: bool = True
+    """Use a small CPU embedding model so recall can match synonyms. Falls back to keywords."""
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_cache: Path = PROJECT_ROOT / "data" / "models"
+    semantic_min_score: float = 0.55
+    """Cosine similarity a memory needs to count as related when embeddings are on."""
+
+
+@dataclass(frozen=True)
+class ConversationConfig:
+    persona_file: Path = PROJECT_ROOT / "data" / "persona.md"
+    log_enabled: bool = True
+    log_dir: Path = PROJECT_ROOT / "logs" / "conversations"
 
 
 @dataclass(frozen=True)
@@ -51,6 +94,8 @@ class InputConfig:
     mode: str = "continuous"
     confirm_timeout_s: float = 30.0
     """Seconds to wait for a yes or no. No answer in time counts as no."""
+    confirm_low_confidence_tools: bool = True
+    """Ask for a yes before any tool runs in a turn whose speech was heard with low confidence."""
 
 
 @dataclass(frozen=True)
@@ -135,6 +180,8 @@ class AppConfig:
     input: InputConfig = InputConfig()
     tts: TtsConfig = TtsConfig()
     display: DisplayConfig = DisplayConfig()
+    memory: MemoryConfig = MemoryConfig()
+    conversation: ConversationConfig = ConversationConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> AppConfig:
@@ -153,13 +200,13 @@ def load_config(path: Path | None = None, environ: Mapping[str, str] | None = No
 
     sections = {
         name: _section(raw, name)
-        for name in ("llm", "tools", "audio", "input", "tts", "display")
+        for name in ("llm", "tools", "audio", "input", "tts", "display", "memory", "conversation")
     }
     for env_name, (section, key) in ENV_OVERRIDES.items():
         if env.get(env_name):
             sections[section][key] = env[env_name]
 
-    llm_raw = sections["llm"]
+    llm_raw = {**LLM_DEFAULTS, **sections["llm"]}
     tools_raw = sections["tools"]
 
     base_url = _str("llm", llm_raw, "base_url").rstrip("/")
@@ -177,12 +224,81 @@ def load_config(path: Path | None = None, environ: Mapping[str, str] | None = No
             temperature=_float("llm", llm_raw, "temperature", 0.0, 2.0),
             timeout_s=_float("llm", llm_raw, "timeout_s", 1.0, 600.0),
             max_tool_rounds=_int("llm", llm_raw, "max_tool_rounds", 1, 20),
+            context_tokens=_int("llm", llm_raw, "context_tokens", 0, 1_000_000),
+            reply_reserve_tokens=_int("llm", llm_raw, "reply_reserve_tokens", 128, 100_000),
+            compact_at=_float("llm", llm_raw, "compact_at", 0.3, 0.95),
+            keep_recent_turns=_int("llm", llm_raw, "keep_recent_turns", 1, 50),
+            max_tool_result_chars=_int("llm", llm_raw, "max_tool_result_chars", 200, 100_000),
+            max_summary_chars=_int("llm", llm_raw, "max_summary_chars", 200, 20_000),
+            connect_retries=_int("llm", llm_raw, "connect_retries", 0, 10),
+            retry_delay_s=_float("llm", llm_raw, "retry_delay_s", 0.0, 60.0),
         ),
         tools=ToolsConfig(notes_dir=notes_dir, apps_file=apps_file),
         audio=_audio_config(sections["audio"]),
         input=_input_config(sections["input"]),
         tts=_tts_config(sections["tts"]),
         display=_display_config(sections["display"]),
+        memory=_memory_config(sections["memory"]),
+        conversation=_conversation_config(sections["conversation"]),
+    )
+
+
+LLM_DEFAULTS: dict[str, Any] = {
+    "context_tokens": 0,
+    "reply_reserve_tokens": 1024,
+    "compact_at": 0.7,
+    "keep_recent_turns": 4,
+    "max_tool_result_chars": 2000,
+    "max_summary_chars": 1500,
+    "connect_retries": 2,
+    "retry_delay_s": 1.0,
+}
+
+
+def _memory_config(raw: dict[str, Any]) -> MemoryConfig:
+    values: dict[str, Any] = {
+        "enabled": True,
+        "db_path": "data/memory/memories.sqlite",
+        "max_in_prompt": 5,
+        "max_chars": 300,
+        "auto_save": True,
+        "announce_auto": False,
+        "embeddings": True,
+        "embedding_model": "BAAI/bge-small-en-v1.5",
+        "embedding_cache": "data/models",
+        "semantic_min_score": 0.55,
+        **raw,
+    }
+    for flag in ("enabled", "auto_save", "announce_auto", "embeddings"):
+        if not isinstance(values[flag], bool):
+            raise ConfigError(f"memory.{flag} must be true or false")
+    return MemoryConfig(
+        enabled=values["enabled"],
+        db_path=_project_path(_str("memory", values, "db_path")),
+        max_in_prompt=_int("memory", values, "max_in_prompt", 0, 20),
+        max_chars=_int("memory", values, "max_chars", 40, 2000),
+        auto_save=values["auto_save"],
+        announce_auto=values["announce_auto"],
+        embeddings=values["embeddings"],
+        embedding_model=_str("memory", values, "embedding_model"),
+        embedding_cache=_project_path(_str("memory", values, "embedding_cache")),
+        semantic_min_score=_float("memory", values, "semantic_min_score", 0.0, 1.0),
+    )
+
+
+def _conversation_config(raw: dict[str, Any]) -> ConversationConfig:
+    values = {
+        "persona_file": "data/persona.md",
+        "log_enabled": True,
+        "log_dir": "logs/conversations",
+        **raw,
+    }
+    if not isinstance(values["log_enabled"], bool):
+        raise ConfigError("conversation.log_enabled must be true or false")
+    return ConversationConfig(
+        persona_file=_project_path(_str("conversation", values, "persona_file")),
+        log_enabled=values["log_enabled"],
+        log_dir=_project_path(_str("conversation", values, "log_dir")),
     )
 
 
@@ -278,10 +394,13 @@ def _display_config(raw: dict[str, Any]) -> DisplayConfig:
 
 
 def _input_config(raw: dict[str, Any]) -> InputConfig:
-    values = {"mode": "continuous", "confirm_timeout_s": 30, **raw}
+    values = {"mode": "continuous", "confirm_timeout_s": 30, "confirm_low_confidence_tools": True, **raw}
+    if not isinstance(values["confirm_low_confidence_tools"], bool):
+        raise ConfigError("input.confirm_low_confidence_tools must be true or false")
     return InputConfig(
         mode=_choice("input", values, "mode", INPUT_MODES),
         confirm_timeout_s=_float("input", values, "confirm_timeout_s", 5.0, 300.0),
+        confirm_low_confidence_tools=values["confirm_low_confidence_tools"],
     )
 
 

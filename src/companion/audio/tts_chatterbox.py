@@ -60,6 +60,8 @@ class ChatterboxSynthesizer:
         self._python = Path(python)
         self._project_root = Path(project_root)
         self._engine = engine
+        self._host = host
+        self._port = port
         self._base = f"http://{host}:{port}"
         self._device = device
         self._offline = offline
@@ -204,9 +206,9 @@ class ChatterboxSynthesizer:
             "-m",
             SERVER_MODULE,
             "--host",
-            "127.0.0.1",
+            self._host,
             "--port",
-            str(_port_of(self._base)),
+            str(self._port),
             "--engine",
             self._engine,
             "--device",
@@ -223,20 +225,21 @@ class ChatterboxSynthesizer:
             env.pop("HF_HUB_OFFLINE", None)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = self._log_path.open("ab")
-        self._process = self._popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=self._log,
-            stderr=subprocess.STDOUT,
-            cwd=str(self._project_root),
-            env=env,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        try:
+            self._process = self._popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=self._log,
+                stderr=subprocess.STDOUT,
+                cwd=str(self._project_root),
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            self._log.close()
+            self._log = None
+            raise SpeechError(f"could not start the Chatterbox server: {exc}") from exc
         atexit.register(self.close)
-
-
-def _port_of(base: str) -> int:
-    return int(base.rsplit(":", 1)[1])
 
 
 def _error_text(exc: urllib.error.HTTPError) -> str:

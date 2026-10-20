@@ -79,7 +79,7 @@ Replies are spoken by one of three engines, chosen with `tts.engine` in [config.
 
 - `chatterbox_turbo` (default): Resemble AI's Chatterbox-Turbo (350M, English, GPU). It can render paralinguistic tags such as `[laugh]`, `[chuckle]`, and `[cough]`. The model runs in a separate server process from its own virtual environment, `.venv-tts`, because it needs a newer torch than the main app.
 - `chatterbox_nano`: Resemble AI's Chatterbox-Nano (110M, English). Smaller and faster to load than Turbo, with the same tag list read from the model. It runs on GPU (`tts.device: cuda`) or CPU, but CPU is too slow for live speech (see measurements below).
-- `piper` (fallback): Piper on CPU. Piper cannot render tags. If Chatterbox cannot start, the app falls back to Piper and prints why.
+- `piper` (fallback): Piper on CPU. Piper cannot render tags. If Chatterbox cannot start, the app falls back to Piper and prints why. If a Chatterbox request fails mid-session, the app restarts the server once and retries. A second failure switches to Piper for the rest of the session and says so aloud. Barge-in is never counted as a failure. Piper loads lazily, so its voice file must exist for the fallback to work.
 
 Piper setup, from the project root in PowerShell:
 
@@ -158,7 +158,21 @@ $env:PYTHONPATH = "src"
 python -m companion
 ```
 
-In-chat commands: `/tools` lists tools (tools that ask first are marked), `/mics` lists microphones, `/reset` clears the conversation, `/exit` quits. Type a message and press Enter to chat. Unknown `/` commands are reported as unknown; they are not sent to the model. Ctrl+C quits at any time.
+In-chat commands: `/tools` lists tools (tools that ask first are marked), `/mics` lists microphones, `/new` (or `/reset`) starts a new conversation, `/status` shows the model, context use, memory count, and log file, `/exit` quits. Type a message and press Enter to chat. Unknown `/` commands are reported as unknown; they are not sent to the model. Ctrl+C quits at any time.
+
+## Conversation, persona, and memory
+
+- **Persona:** the personality is in [data/persona.md](data/persona.md). It is read at the start of each conversation (`/new` picks up edits). A missing or empty file uses a built-in default. The safety rules in the system prompt always come first.
+- **Long-term memory:** facts are stored in `data/memory/memories.sqlite`. The tools `remember`, `recall`, `list_memories`, and `forget` manage them.
+  - Remember flows: "remember that ..." saves at once. "remember this" saves the previous message. A bare "remember" followed by the content in the next message also saves. Vague notes such as "it is at 3" are rewritten from the earlier message when one is available. Saves and forgets are decided by the app, not the model, so the model cannot claim a save that did not happen.
+  - `forget <target>` reads back the matching texts and needs an exact yes or no. "Forget that" deletes the latest automatically saved memory immediately, with no read-back.
+  - `remember` refuses text that looks like a password, key, or token.
+  - Auto-save (`memory.auto_save`, default true) lets the companion save facts you state about yourself after a turn. It is skipped for tool turns, low-confidence speech, and remember or forget messages. Set `memory.announce_auto: true` to hear a short notice when it saves. A later contradiction can overwrite an earlier memory.
+  - Recall is hybrid: keyword matches (SQLite FTS5, Porter stemming) plus semantic matches from a small CPU embedding model (`BAAI/bge-small-en-v1.5` through fastembed). Settings are under `memory:`: `embeddings` (true or false), `embedding_model`, `embedding_cache` (default `data/models`), and `semantic_min_score` (default 0.55, the cosine cutoff). The first run downloads the model and needs internet. If the model cannot load, the app prints a notice and uses keyword recall only.
+  - Measured cosine scores with this model are close together for short queries (for example, "my job" against "User works as a nurse in Leeds." scored 0.572, and an unrelated memory reached 0.594). Tune `semantic_min_score` if you see missed or extra recalls.
+- **Long conversations:** when history passes `llm.compact_at` of the context window, older turns are summarized in the background by one extra LLM call. The most recent `llm.keep_recent_turns` turns are kept as they are. The window is read from LM Studio, or set `llm.context_tokens`.
+- **Errors:** if the LLM server is unreachable, the companion retries `llm.connect_retries` times with a growing delay, then reports the problem and keeps the conversation intact. Tool results longer than `llm.max_tool_result_chars` are shortened before the model sees them.
+- **Conversation log:** each conversation is saved as plain text under `logs/conversations/`. Set `conversation.log_enabled: false` to turn this off.
 
 See [MANUAL_TESTS.md](MANUAL_TESTS.md) for the hands-on checks to run after changes to speech input.
 
@@ -177,6 +191,23 @@ Settings live in [config.yaml](config.yaml). Environment variables override them
 | `COMPANION_NOTES_DIR` | `tools.notes_dir` |
 
 Other `tools` settings: `notes_dir` (default `data/notes`) and `apps_file` (default `data/apps.json`).
+
+Phase 5 settings:
+
+| Section | Key | Default | Meaning |
+|---|---|---|---|
+| `llm` | `context_tokens` | `0` | Context window; `0` reads it from LM Studio (fallback 8192) |
+| `llm` | `compact_at` | `0.7` | Summarize older turns past this share of the window |
+| `llm` | `keep_recent_turns` | `4` | Recent turns kept word for word |
+| `llm` | `max_tool_result_chars` | `2000` | Tool output cut-off before it goes back to the model |
+| `llm` | `max_summary_chars` | `1500` | Limit on the summary text |
+| `llm` | `connect_retries` / `retry_delay_s` | `2` / `1.0` | Retries when the server is down |
+| `conversation` | `persona_file` | `data/persona.md` | Personality text |
+| `conversation` | `log_enabled` / `log_dir` | `true` / `logs/conversations` | Plain-text conversation log |
+| `memory` | `enabled` / `db_path` | `true` / `data/memory/memories.sqlite` | Long-term memory store |
+| `memory` | `max_in_prompt` / `max_chars` | `5` / `300` | Memories shown per turn / longest memory |
+
+Caveats: recall is keyword-based, so it does not match synonyms. `forget` confirmation shows the words you said, not the memories it will remove. Summaries cost one extra LLM call each time they run.
 
 ## Adding a tool
 

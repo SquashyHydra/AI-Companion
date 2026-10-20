@@ -17,6 +17,23 @@ from companion.llm.client import TurnOutcome
 DOUBLE_CANCEL_S = 2.0
 """Two Ctrl+C presses this close together quit the app, even while a confirmation is pending."""
 
+MIC_RETRY_S = 10.0
+"""While the microphone is failing, try to reopen it this often."""
+
+SPOKEN_FAILURE = "Sorry, I could not get an answer just now. Please try again."
+"""What the companion says aloud when a reply fails."""
+
+RESET_PHRASES = frozenset(
+    {
+        "new conversation",
+        "start a new conversation",
+        "start new conversation",
+        "clear conversation",
+        "reset conversation",
+    }
+)
+"""Spoken phrases that start a new conversation, the same as /new."""
+
 
 class State(Enum):
     PAUSED = "paused"
@@ -70,6 +87,16 @@ class MicFailed:
 
 
 @dataclass(frozen=True)
+class MicReady:
+    """The microphone started. Clears a failure and lets listening resume."""
+
+
+@dataclass(frozen=True)
+class Tick:
+    """Sent regularly by the loop. Used to retry the microphone while it is failing."""
+
+
+@dataclass(frozen=True)
 class Transcript:
     text: str = ""
     low_confidence: bool = False
@@ -110,6 +137,8 @@ class Notice:
     """A message from another thread (for example, a speech error) to show on screen."""
 
     text: str
+    spoken: str | None = None
+    """If set, also say this aloud."""
 
 
 Event = (
@@ -155,6 +184,10 @@ class Transcribe:
 class StartReply:
     turn: int
     text: str
+    low_confidence: bool = False
+    """Set only when the confirm option is on, for tool confirmations."""
+    unsure: bool = False
+    """The transcript was low confidence, so automatic memory saves are skipped."""
 
 
 @dataclass(frozen=True)
@@ -190,6 +223,13 @@ class RunCommand:
 @dataclass(frozen=True)
 class Print:
     text: str
+    spoken: str | None = None
+    """If set, also say this aloud (used for reply failures)."""
+
+
+@dataclass(frozen=True)
+class ShowStatus:
+    pass
 
 
 @dataclass(frozen=True)
@@ -214,6 +254,7 @@ Action = (
     | ResetHistory
     | RunCommand
     | Print
+    | ShowStatus
     | ResolveConfirmation
     | Shutdown
 )
@@ -230,12 +271,17 @@ def parse_yes_no(text: str) -> bool | None:
 
     Punctuation and case are ignored. "Yes, please" is not a yes.
     """
-    normalized = " ".join(re.sub(r"[^a-z ]", " ", text.lower()).split())
+    normalized = _phrase(text)
     if normalized in _YES:
         return True
     if normalized in _NO:
         return False
     return None
+
+
+def _phrase(text: str) -> str:
+    """Lowercase words only, with punctuation removed and spaces collapsed."""
+    return " ".join(re.sub(r"[^a-z ]", " ", text.lower()).split())
 
 
 # ---------- Machine ----------
@@ -253,18 +299,26 @@ class ListenMachine:
         barge_in_ms: int,
         speech_busy: Callable[[], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        confirm_low_confidence: bool = False,
+        mic_retry_s: float = MIC_RETRY_S,
     ) -> None:
         self._barge_in_ms = barge_in_ms
         self._speech_busy = speech_busy or (lambda: False)
         self._clock = clock
+        self._confirm_low = confirm_low_confidence
+        self._mic_retry_s = mic_retry_s
         self._last_cancel: float | None = None
         self.paused = False
         self.speaking = False
+        self.mic_failed = False
+        self._next_mic_retry = 0.0
         self._transcribing = False
         self._pending: deque[np.ndarray] = deque()
         self._reply_turn: int | None = None
         self._reply_cancelled = False
         self._deferred_text: str | None = None
+        self._deferred_low = False
         self._deferred_reset = False
         self._awaiting_confirm = False
         self._turns = 0
@@ -323,13 +377,29 @@ class ListenMachine:
                 self.paused = True
                 self.speaking = False
                 self._pending.clear()
+                self._next_mic_retry = self._clock() + self._mic_retry_s
+                if self.mic_failed:
+                    return [StopMic()]
+                self.mic_failed = True
                 return [
                     StopMic(),
                     Print(
                         f"Microphone error: {message}. Typing still works. "
-                        "Press Enter to try the microphone again."
+                        f"Retrying every {self._mic_retry_s:g} seconds. "
+                        "Press Enter to try the microphone now."
                     ),
                 ]
+            case MicReady():
+                if not self.mic_failed:
+                    return []
+                self.mic_failed = False
+                self.paused = False
+                return [Print("Microphone is back. Listening again.")]
+            case Tick():
+                if self.mic_failed and self._clock() >= self._next_mic_retry:
+                    self._next_mic_retry = self._clock() + self._mic_retry_s
+                    return [StartMic()]
+                return []
             case SpeechOngoing(voiced_ms=voiced_ms):
                 return self._speech_ongoing(voiced_ms)
             case Noise():
@@ -346,7 +416,9 @@ class ListenMachine:
             case ReplyDone(turn=turn, outcome=outcome):
                 return self._reply_finished(turn, [ApplyOutcome(outcome)])
             case ReplyFailed(turn=turn, message=message):
-                return self._reply_finished(turn, [Print(f"Error: {message}")])
+                return self._reply_finished(
+                    turn, [Print(f"Error: {message}", spoken=SPOKEN_FAILURE)]
+                )
             case ConfirmRequest(question=question, timeout_s=timeout_s):
                 self._awaiting_confirm = True
                 timeout_note = (
@@ -361,8 +433,8 @@ class ListenMachine:
             case ConfirmTimedOut():
                 self._awaiting_confirm = False
                 return [Print("No answer, so the action was cancelled.")]
-            case Notice(text=text):
-                return [Print(text)]
+            case Notice(text=text, spoken=spoken):
+                return [Print(text, spoken=spoken)]
         raise TypeError(f"unknown event: {event!r}")
 
     # ----- handlers -----
@@ -373,6 +445,7 @@ class ListenMachine:
             return [Print("Answer yes or no first.")]
         if self.paused:
             self.paused = False
+            self.mic_failed = False
             return [StartMic(), Print("Listening again.")]
         self.paused = True
         self.speaking = False
@@ -391,15 +464,17 @@ class ListenMachine:
             return self.handle(Quit())
         if self._awaiting_confirm:
             return [Print("Please answer yes or no.")]
-        if command == "/reset":
+        if command == "/reset" or command == "/new":
             if self.reply_running:
                 self._deferred_reset = True
                 self._deferred_text = None
                 return self._cancel_reply()
             return [ResetHistory()]
+        if command == "/status":
+            return [ShowStatus()]
         return [RunCommand(text)]
 
-    def _user_text(self, text: str) -> list[Action]:
+    def _user_text(self, text: str, low_confidence: bool = False) -> list[Action]:
         if not text.strip():
             return []
         if self._awaiting_confirm:
@@ -408,11 +483,14 @@ class ListenMachine:
                 return [Print("Please answer yes or no.")]
             self._awaiting_confirm = False
             return [ResolveConfirmation(answer)]
+        if _phrase(text) in RESET_PHRASES:
+            return self._command("/new")
         if self.reply_running:
             actions: list[Action] = [] if self._reply_cancelled else self._cancel_reply()
             self._deferred_text = text
+            self._deferred_low = low_confidence
             return actions
-        return self._start_reply(text)
+        return self._start_reply(text, low_confidence)
 
     def _speech_ongoing(self, voiced_ms: int) -> list[Action]:
         if self.paused:
@@ -460,7 +538,7 @@ class ListenMachine:
         else:
             flag = " (low confidence)" if event.low_confidence else ""
             actions.append(Print(f'Heard{flag}: "{event.text}"'))
-            actions += self._user_text(event.text)
+            actions += self._user_text(event.text, event.low_confidence)
         if self._pending and not self.paused:
             self._transcribing = True
             actions.append(Transcribe(self._pending.popleft()))
@@ -495,15 +573,23 @@ class ListenMachine:
             actions = [*actions, ResetHistory()]
         if self._deferred_text is not None:
             text, self._deferred_text = self._deferred_text, None
+            low, self._deferred_low = self._deferred_low, False
             if not self.paused:
-                actions = [*actions, *self._start_reply(text)]
+                actions = [*actions, *self._start_reply(text, low)]
         return actions
 
-    def _start_reply(self, text: str) -> list[Action]:
+    def _start_reply(self, text: str, low_confidence: bool = False) -> list[Action]:
         self._turns += 1
         self._reply_turn = self._turns
         self._reply_cancelled = False
-        return [StartReply(self._reply_turn, text)]
+        return [
+            StartReply(
+                self._reply_turn,
+                text,
+                low_confidence=self._confirm_low and low_confidence,
+                unsure=low_confidence,
+            )
+        ]
 
     def _cancel_reply(self) -> list[Action]:
         self._reply_cancelled = True
