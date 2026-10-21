@@ -141,10 +141,15 @@ def _highest(values: Iterable[float | None]) -> float | None:
 
 
 def speech_vocabulary(audio_config: AudioConfig, apps_file: Path | None) -> list[str]:
-    """Words to bias recognition toward: the configured vocabulary plus allowlisted app names."""
+    """Words to bias recognition toward: the configured vocabulary, allowlisted app names, and
+    artist and album folder names from the file index (once the index has been built)."""
     words = list(audio_config.vocabulary)
     if audio_config.include_app_names and apps_file is not None:
         words += list(load_allowlist(apps_file).keys())
+    if audio_config.include_file_names:
+        from companion.tools.builtin.files import file_index
+
+        words += file_index().speech_terms()
     unique: dict[str, str] = {}
     for word in words:
         cleaned = " ".join(str(word).split())

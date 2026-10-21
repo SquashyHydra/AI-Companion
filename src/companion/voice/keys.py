@@ -133,6 +133,13 @@ class KeyReader:
         return events
 
 
+class NoKeys:
+    """Stands in for KeyReader in background mode. There is no console, so no keys ever arrive."""
+
+    def poll(self, confirming: bool = False) -> list[Event]:
+        return []
+
+
 def _default_kbhit() -> bool:
     import msvcrt
 

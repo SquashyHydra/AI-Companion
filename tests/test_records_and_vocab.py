@@ -63,7 +63,11 @@ def test_build_prompt_dedupes_and_returns_none_when_empty():
 def test_speech_vocabulary_merges_config_words_and_allowlist_names(tmp_path):
     apps = tmp_path / "apps.json"
     apps.write_text(json.dumps({"Spotify": "C:/Spotify.exe", "Notepad": "notepad.exe"}), encoding="utf-8")
-    config = SimpleNamespace(vocabulary=("Mario", "mario", "  Zelda  "), include_app_names=True)
+    config = SimpleNamespace(
+        vocabulary=("Mario", "mario", "  Zelda  "),
+        include_app_names=True,
+        include_file_names=False,
+    )
 
     words = speech_vocabulary(config, apps)
 
@@ -77,6 +81,8 @@ def test_speech_vocabulary_merges_config_words_and_allowlist_names(tmp_path):
 def test_speech_vocabulary_skips_allowlist_when_disabled(tmp_path):
     apps = tmp_path / "apps.json"
     apps.write_text(json.dumps({"Spotify": "x"}), encoding="utf-8")
-    config = SimpleNamespace(vocabulary=("Mario",), include_app_names=False)
+    config = SimpleNamespace(
+        vocabulary=("Mario",), include_app_names=False, include_file_names=False
+    )
 
     assert [word.lower() for word in speech_vocabulary(config, apps)] == ["mario"]

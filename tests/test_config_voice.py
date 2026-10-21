@@ -12,8 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def test_shipped_config_has_continuous_mode_and_listening_defaults():
     config = load_config(PROJECT_ROOT / "config.yaml", {})
     assert config.input.mode == "continuous"
-    assert config.audio.end_silence_ms == 700
-    assert config.audio.barge_in_ms == 400
+    assert config.audio.end_silence_ms == 900
+    assert config.audio.barge_in_ms == 900
     assert config.audio.beam_size == 5
     assert config.audio.save_utterances is False
 

@@ -6,3 +6,6 @@ numpy>=2.0
 faster-whisper>=1.2
 silero-vad>=6.2
 fastembed>=0.9
+pystray>=0.19
+pillow>=10.0
+openwakeword>=0.6

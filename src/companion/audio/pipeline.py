@@ -59,6 +59,7 @@ class ListeningPipeline:
         reset_detector: Callable[[], None] | None = None,
         poll_s: float = 0.1,
         gate: Callable[[], bool] | None = None,
+        muted_frame: Callable[[np.ndarray], None] | None = None,
     ) -> None:
         self._source = source
         self._detect = detect
@@ -68,6 +69,7 @@ class ListeningPipeline:
         self._reset_detector = reset_detector or (lambda: None)
         self._poll_s = poll_s
         self._gate = gate
+        self._muted_frame = muted_frame
         self._rechunker = Rechunker()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -115,6 +117,9 @@ class ListeningPipeline:
                         self._segmenter.reset()
                         self._rechunker.reset()
                         self._reset_detector()
+                    if self._muted_frame is not None:
+                        for frame in self._rechunker.feed(chunk):
+                            self._muted_frame(frame)
                     continue
                 gated = False
                 for frame in self._rechunker.feed(chunk):

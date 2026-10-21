@@ -11,6 +11,7 @@ from companion.audio.push_to_talk import PushToTalk
 from companion.conversation import Conversation
 from companion.llm.client import LLMClient, LLMError, Messages
 from companion.llm.prompts import SYSTEM_PROMPT
+from companion.notices import notices
 from companion.tools.registry import ToolRegistry
 
 COMMANDS = "/tools  /mics  /new  /status  /exit"
@@ -43,7 +44,11 @@ def microphones_text() -> str:
 def tools_text(registry: ToolRegistry) -> str:
     lines = []
     for registered in registry.tools:
-        note = " (asks first)" if registered.requires_confirmation else ""
+        rule = registered.requires_confirmation
+        if callable(rule):
+            note = " (may ask first)"
+        else:
+            note = " (asks first)" if rule else ""
         lines.append(f"  {registered.name}{note}: {registered.description}")
     return "\n".join(lines) or "No tools registered."
 
@@ -105,6 +110,8 @@ def run_text_loop(
     while True:
         if conversation is not None:
             messages = conversation.apply(messages)
+        for notice in notices.drain():
+            print(f"\n* {notice}")
         try:
             user_text = input_fn("\nYou> ").strip()
         except (EOFError, KeyboardInterrupt):

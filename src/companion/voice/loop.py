@@ -25,12 +25,14 @@ from companion.audio.segmenter import Segmenter
 from companion.audio.stt import Transcription, make_transcriber
 from companion.audio.tts import load_voice
 from companion.audio.vad import SileroFrameDetector
+from companion.audio.wakeword import FrameDetect, WakeGate, WakeWordDetector
 from companion.config import PROJECT_ROOT, AppConfig, AudioConfig
 from companion.conversation import Conversation
 from companion.llm.client import INTERRUPTED_MARK, LOW_CONFIDENCE_NOTE, LLMClient, LLMError, Messages, TurnOutcome
+from companion.notices import notices
 from companion.tools.registry import ToolRegistry
 from companion.voice.confirm import EventConfirmer
-from companion.voice.keys import KeyReader, LineEditor
+from companion.voice.keys import KeyReader, LineEditor, NoKeys
 from companion.voice.machine import (
     ApplyOutcome,
     CancelReply,
@@ -55,8 +57,10 @@ from companion.voice.machine import (
     StopMic,
     StopSpeech,
     Tick,
+    Toggle,
     Transcribe,
     Transcript,
+    WakeHeard,
 )
 from companion.voice.speech import SpeechOut
 from companion.voice.tags import TagDisplayFilter
@@ -103,6 +107,7 @@ class VoiceLoop:
         speech: SpeechOut | None = None,
         show_voice_tags: bool = True,
         conversation: Conversation | None = None,
+        follow_up: Callable[[], None] | None = None,
     ) -> None:
         self._machine = machine
         self._pipeline = pipeline
@@ -134,16 +139,34 @@ class VoiceLoop:
         # Speech state for the current reply. _cut is the text spoken before speech stopped.
         self._cut: str | None = None
         self._reply_in_history = False
+        self._listening_listener: Callable[[bool], None] | None = None
+        self._reported_listening: bool | None = None
+        # Called once each time a reply finishes playing, so the wake word can be skipped for a while.
+        self._follow_up = follow_up
+        self._playing = False
 
     @property
     def done(self) -> bool:
         return self._done
+
+    def request_quit(self) -> None:
+        """Ask the loop to quit. Safe to call from any thread, such as the tray icon."""
+        self._events.put(Quit())
+
+    def request_toggle(self) -> None:
+        """Pause or resume listening, as Enter does. Safe to call from any thread, such as the tray icon."""
+        self._events.put(Toggle())
+
+    def set_listening_listener(self, listener: Callable[[bool], None] | None) -> None:
+        """Be told (on the main thread) whether listening is on, each time that changes."""
+        self._listening_listener = listener
 
     def run(self) -> int:
         self._dispatch(self._machine.start())
         self._editor.redraw()
         try:
             while not self._done:
+                self._watch_playback()
                 for event in self._keys.poll(confirming=self._machine.awaiting_confirm):
                     self._handle(event)
                     if self._done:
@@ -154,6 +177,7 @@ class VoiceLoop:
                     event = self._events.get(timeout=self._tick_s)
                 except queue.Empty:
                     self._handle(Tick())
+                    self._show_notices()
                     continue
                 self._handle(event)
         except KeyboardInterrupt:
@@ -161,6 +185,15 @@ class VoiceLoop:
         finally:
             self._shutdown()
         return 0
+
+    # ----- dispatch -----
+
+    def _watch_playback(self) -> None:
+        """Open the follow-up window when a reply stops playing (and listening is on)."""
+        playing = self._machine.reply_running or (self._speech is not None and self._speech.speaking())
+        if self._playing and not playing and self._follow_up is not None and not self._machine.paused:
+            self._follow_up()
+        self._playing = playing
 
     # ----- dispatch -----
 
@@ -174,6 +207,17 @@ class VoiceLoop:
     def _dispatch(self, actions: list) -> None:
         for action in actions:
             self._perform(action)
+        self._report_listening()
+
+    def _report_listening(self) -> None:
+        listening = not self._machine.paused
+        if listening == self._reported_listening or self._listening_listener is None:
+            return
+        self._reported_listening = listening
+        try:
+            self._listening_listener(listening)
+        except Exception:
+            logger.exception("listening listener failed")
 
     def _perform(self, action: object) -> None:
         match action:
@@ -307,6 +351,14 @@ class VoiceLoop:
             self._line_open = False
         self._editor.show(text)
 
+    def _show_notices(self) -> None:
+        """Show timer and reminder messages. Speak them only when no reply is in progress."""
+        for text in notices.drain():
+            self._print(text)
+            if self._speech is not None and not self._machine.reply_running:
+                self._speech.feed(text)
+                self._speech.finish()
+
     # ----- worker threads -----
 
     def _spawn(self, target: Callable[..., None], *args: object) -> None:
@@ -384,11 +436,13 @@ def build_voice_loop(
     new_history: Callable[[], Messages],
     notify: Callable[[str], None] = print,
     conversation: Conversation | None = None,
+    keyboard: bool = True,
 ) -> VoiceLoop:
     """Load the speech models and build the loop.
 
     Raises SpeechError if the models or the microphone cannot be set up, so the caller can
     fall back to typing. Also points the tool registry at the loop's confirmation prompt.
+    keyboard=False (background mode) reads no keys; the tray icon is then the only control.
     """
     audio = config.audio
     events: queue.Queue[Event] = queue.Queue()
@@ -397,10 +451,14 @@ def build_voice_loop(
 
     transcriber = make_transcriber(audio, config.tools.apps_file)
     detector = SileroFrameDetector()
+    wake_cfg = config.input.wake_word
+    wake = WakeWordDetector(wake_cfg.model, wake_cfg.threshold) if wake_cfg.enabled else None
     notify("Loading speech models (the first run downloads Whisper)...")
     try:
         detector.load()
         transcriber.load()
+        if wake is not None:
+            wake.load()
     except SpeechError:
         raise
     except Exception as exc:
@@ -411,8 +469,36 @@ def build_voice_loop(
     speakers = audio.output_mode == "speakers"
     tail_s = audio.speakers_tail_ms / 1000 if speakers else 0.0
     # Speakers can be heard by the mic, so audio is gated while it plays and for a short tail.
-    # Barge-in is therefore unavailable on speakers.
+    # Voice barge-in is therefore off on speakers; the wake word still interrupts.
     gate = (lambda: speech.speaking(tail_s)) if speech is not None and speakers else None
+
+    listen_detect: FrameDetect = detector
+    reset_listen = detector.reset
+    wake_gate: WakeGate | None = None
+    if wake is not None:
+        wake_gate = WakeGate(
+            detector,
+            wake,
+            window_s=wake_cfg.window_s,
+            reset_detect=detector.reset,
+            # Headphones: keep the gate open while talking, so voice barge-in can hear you.
+            hold=(lambda: speech.speaking()) if speech is not None and not speakers else None,
+            speech_level=audio.vad_threshold,
+            on_wake=lambda: events.put(WakeHeard()),
+        )
+        listen_detect = wake_gate
+        reset_listen = wake_gate.reset
+        notify(
+            f"Wake word on: say '{wake_cfg.model.replace('_', ' ')}' first, then your request "
+            f"(listening for {wake_cfg.window_s:g} s after each wake word)."
+        )
+
+    muted_frame: Callable[[np.ndarray], None] | None = None
+    if wake_gate is not None and speakers:
+        muted_frame = wake_gate.muted
+    follow_up: Callable[[], None] | None = None
+    if wake_gate is not None and wake_cfg.follow_up_s > 0:
+        follow_up = lambda: wake_gate.open_for(wake_cfg.follow_up_s)
 
     try:
         stream = FrameStream(device=resolve_input_device(audio.input_device))
@@ -425,12 +511,13 @@ def build_voice_loop(
         )
         pipeline = ListeningPipeline(
             source=stream,
-            detect=detector,
+            detect=listen_detect,
             segmenter=segmenter,
             on_event=events.put,
             on_error=lambda message: events.put(MicFailed(message)),
-            reset_detector=detector.reset,
+            reset_detector=reset_listen,
             gate=gate,
+            muted_frame=muted_frame,
         )
 
         registry.set_confirmer(
@@ -477,13 +564,16 @@ def build_voice_loop(
             barge_in_ms=audio.barge_in_ms,
             speech_busy=(lambda: speech.speaking()) if speech is not None else None,
             confirm_low_confidence=config.input.confirm_low_confidence_tools,
+            enter_pauses=keyboard,
+            # Voice barge-in needs headphones. On speakers the mic would hear the reply itself.
+            vad_barge_in=not speakers,
         ),
         pipeline=pipeline,
         transcribe=transcriber.transcribe_detailed,
         stream=stream_turn,
         run_command=run_command,
         new_history=new_history,
-        keys=KeyReader(editor),
+        keys=KeyReader(editor) if keyboard else NoKeys(),
         editor=editor,
         events=events,
         answers=answers,
@@ -494,6 +584,7 @@ def build_voice_loop(
         speech=speech,
         show_voice_tags=config.display.show_voice_tags,
         conversation=conversation,
+        follow_up=follow_up,
     )
 
 

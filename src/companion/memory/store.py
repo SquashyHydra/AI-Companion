@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from companion.memory.embedder import Embedder, EmbedderError, cosine
+from companion.memory.guards import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,19 @@ def clean_text(text: str) -> str:
 
 
 _COLUMNS = "id, text, created, source, updated"
+_ALL_RE = re.compile(
+    r"^(?:all|everything)(?:\s+(?:of\s+)?(?:my\s+|the\s+|your\s+)?(?:saved\s+|stored\s+)?"
+    r"(?:memor(?:y|ies)|them|things))?$"
+)
 
 
 def _row(row: tuple) -> Memory:
     return Memory(int(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]))
+
+
+def memory_line(memory: Memory) -> str:
+    """One listed memory: its number, where it came from, and its text."""
+    return f"[{memory.id}] ({memory.source}) {memory.text}"
 
 
 def _now() -> str:
@@ -91,7 +101,15 @@ class MemoryStore:
                 )
             if "embedding" not in present:
                 self._db.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
+            if "norm" not in present:
+                self._db.execute("ALTER TABLE memories ADD COLUMN norm TEXT NOT NULL DEFAULT ''")
             self._db.execute("UPDATE memories SET updated = created WHERE updated = ''")
+            for memory_id, text in self._db.execute(
+                "SELECT id, text FROM memories WHERE norm = ''"
+            ).fetchall():
+                self._db.execute(
+                    "UPDATE memories SET norm = ? WHERE id = ?", (normalize(text), memory_id)
+                )
             self._db.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts "
                 "USING fts5(text, tokenize = 'porter unicode61')"
@@ -101,6 +119,7 @@ class MemoryStore:
                 "WHERE id NOT IN (SELECT rowid FROM memories_fts)"
             )
             self._db.commit()
+        self._create_norm_index()
         self._backfill_embeddings()
 
     @property
@@ -113,14 +132,21 @@ class MemoryStore:
             self._db.close()
 
     def add(self, text: str, source: str = "manual") -> Memory:
+        """Save a memory. If the same text (ignoring case and punctuation) exists, return that one."""
         cleaned = clean_text(text)
+        key = normalize(cleaned)
         created = _now()
         vector = self._vector(cleaned)
         with self._lock:
+            row = self._db.execute(
+                f"SELECT {_COLUMNS} FROM memories WHERE norm = ? ORDER BY id LIMIT 1", (key,)
+            ).fetchone()
+            if row is not None:
+                return _row(row)
             cursor = self._db.execute(
-                "INSERT INTO memories (text, created, updated, source, embedding) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (cleaned, created, created, source, vector),
+                "INSERT INTO memories (text, created, updated, source, embedding, norm) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (cleaned, created, created, source, vector, key),
             )
             memory_id = int(cursor.lastrowid or 0)
             self._db.execute(
@@ -130,8 +156,13 @@ class MemoryStore:
         return Memory(memory_id, cleaned, created, source, created)
 
     def update(self, memory_id: int, text: str, source: str = "auto") -> Memory | None:
-        """Replace the text of one memory, keeping its number and creation time."""
+        """Replace the text of one memory, keeping its number and creation time.
+
+        If the new text already exists as another memory, this memory is removed instead and
+        the existing one is returned.
+        """
         cleaned = clean_text(text)
+        key = normalize(cleaned)
         updated = _now()
         vector = self._vector(cleaned)
         with self._lock:
@@ -140,9 +171,19 @@ class MemoryStore:
             ).fetchone()
             if row is None:
                 return None
+            other = self._db.execute(
+                f"SELECT {_COLUMNS} FROM memories WHERE norm = ? AND id != ? ORDER BY id LIMIT 1",
+                (key, memory_id),
+            ).fetchone()
+            if other is not None:
+                self._db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+                self._db.execute("DELETE FROM memories_fts WHERE rowid = ?", (memory_id,))
+                self._db.commit()
+                return _row(other)
             self._db.execute(
-                "UPDATE memories SET text = ?, updated = ?, source = ?, embedding = ? WHERE id = ?",
-                (cleaned, updated, source, vector, memory_id),
+                "UPDATE memories SET text = ?, updated = ?, source = ?, embedding = ?, norm = ? "
+                "WHERE id = ?",
+                (cleaned, updated, source, vector, key, memory_id),
             )
             self._db.execute("DELETE FROM memories_fts WHERE rowid = ?", (memory_id,))
             self._db.execute(
@@ -282,13 +323,89 @@ class MemoryStore:
 
     def find_ids(self, target: str) -> list[Memory]:
         """Resolve a forget target: a memory number, 'all', or words to match."""
-        stripped = target.strip().lower()
-        if stripped == "all":
+        stripped = " ".join(target.strip().lower().split())
+        if _ALL_RE.match(stripped):
             return self.all()
         if stripped.lstrip("#").isdigit():
             number = int(stripped.lstrip("#"))
             return [memory for memory in self.all() if memory.id == number]
         return self.search(target, limit=10_000)
+
+    def existing_for(self, text: str) -> Memory | None:
+        """The memory already holding this text, ignoring case and punctuation. None if absent."""
+        key = normalize(clean_text(text))
+        if not key:
+            return None
+        with self._lock:
+            row = self._db.execute(
+                f"SELECT {_COLUMNS} FROM memories WHERE norm = ? ORDER BY id LIMIT 1", (key,)
+            ).fetchone()
+        return _row(row) if row is not None else None
+
+    def count(self) -> int:
+        with self._lock:
+            return int(self._db.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+
+    def get_many(self, memory_ids: list[int]) -> list[Memory]:
+        """The memories with these numbers that exist, oldest number first."""
+        if not memory_ids:
+            return []
+        placeholders = ", ".join("?" for _ in memory_ids)
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {_COLUMNS} FROM memories WHERE id IN ({placeholders}) ORDER BY id",
+                memory_ids,
+            ).fetchall()
+        return [_row(row) for row in rows]
+
+    def duplicate_groups(self) -> list[list[Memory]]:
+        """Groups of memories with the same normalized text. Each group is oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {_COLUMNS} FROM memories WHERE norm IN "
+                "(SELECT norm FROM memories GROUP BY norm HAVING COUNT(*) > 1) "
+                "ORDER BY norm, id"
+            ).fetchall()
+        groups: dict[str, list[Memory]] = {}
+        for row in rows:
+            memory = _row(row)
+            groups.setdefault(normalize(memory.text), []).append(memory)
+        return list(groups.values())
+
+    def has_norm_index(self) -> bool:
+        """True when the database enforces one memory per normalized text."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_norm'"
+            ).fetchone()
+        return row is not None
+
+    def backup(self, folder: Path) -> Path:
+        """Copy the whole database into folder. SQLite's backup API keeps the copy consistent."""
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        target = folder / f"memories-{stamp}.sqlite"
+        with self._lock:
+            destination = sqlite3.connect(str(target))
+            try:
+                self._db.backup(destination)
+            finally:
+                destination.close()
+        return target
+
+    def _create_norm_index(self) -> None:
+        """Enforce one memory per normalized text. Skipped while older duplicates remain."""
+        with self._lock:
+            try:
+                self._db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_norm ON memories(norm)"
+                )
+                self._db.commit()
+            except sqlite3.IntegrityError:
+                logger.warning(
+                    "Duplicate memories exist, so the unique index is not created yet. "
+                    "Run: python -m companion.memory_admin dedupe --apply"
+                )
 
     def delete(self, memory_ids: list[int]) -> int:
         if not memory_ids:

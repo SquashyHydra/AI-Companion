@@ -52,6 +52,11 @@ class Toggle:
 
 
 @dataclass(frozen=True)
+class WakeHeard:
+    """The wake word was said while the companion is talking. Stops speech and cancels the reply."""
+
+
+@dataclass(frozen=True)
 class Quit:
     """Ctrl+C or end of input."""
 
@@ -143,6 +148,7 @@ class Notice:
 
 Event = (
     Toggle
+    | WakeHeard
     | Quit
     | Answer
     | Cancel
@@ -302,8 +308,14 @@ class ListenMachine:
         *,
         confirm_low_confidence: bool = False,
         mic_retry_s: float = MIC_RETRY_S,
+        enter_pauses: bool = True,
+        vad_barge_in: bool = True,
     ) -> None:
         self._barge_in_ms = barge_in_ms
+        # enter_pauses is False in background mode, where there is no keyboard and the tray icon pauses.
+        self._enter_pauses = enter_pauses
+        # vad_barge_in is False on speakers, where the mic hears the reply and must not cut it off.
+        self._vad_barge_in = vad_barge_in
         self._speech_busy = speech_busy or (lambda: False)
         self._clock = clock
         self._confirm_low = confirm_low_confidence
@@ -344,12 +356,18 @@ class ListenMachine:
         return self._awaiting_confirm
 
     def start(self) -> list[Action]:
-        return [StartMic(), Print("Listening. Speak anytime. Press Enter to pause. Ctrl+C to quit.")]
+        if self._enter_pauses:
+            hint = "Listening. Speak anytime. Press Enter to pause. Ctrl+C to quit."
+        else:
+            hint = "Listening. Speak anytime. Use the tray icon to pause or quit."
+        return [StartMic(), Print(hint)]
 
     def handle(self, event: Event) -> list[Action]:
         match event:
             case Toggle():
                 return self._toggle()
+            case WakeHeard():
+                return self._wake_heard()
             case Quit():
                 actions: list[Action] = self._cancel_reply() if self.reply_running else []
                 return [*actions, StopMic(), Shutdown()]
@@ -385,8 +403,8 @@ class ListenMachine:
                     StopMic(),
                     Print(
                         f"Microphone error: {message}. Typing still works. "
-                        f"Retrying every {self._mic_retry_s:g} seconds. "
-                        "Press Enter to try the microphone now."
+                        f"Retrying every {self._mic_retry_s:g} seconds."
+                        + (" Press Enter to try the microphone now." if self._enter_pauses else "")
                     ),
                 ]
             case MicReady():
@@ -439,6 +457,17 @@ class ListenMachine:
 
     # ----- handlers -----
 
+    def _wake_heard(self) -> list[Action]:
+        """Wake-word barge-in: stop talking and cancel the reply. Speech after it is heard as usual."""
+        if self.paused or self._awaiting_confirm:
+            return []
+        actions: list[Action] = []
+        if self.reply_running and not self._reply_cancelled:
+            actions += self._cancel_reply()
+        if self._speech_busy():
+            actions.append(StopSpeech())
+        return actions
+
     def _toggle(self) -> list[Action]:
         if self._awaiting_confirm:
             # Enter never answers a confirmation and never pauses while one is pending.
@@ -451,12 +480,17 @@ class ListenMachine:
         self.speaking = False
         self._pending.clear()
         self._deferred_text = None
-        actions: list[Action] = [StopMic(), Print("Paused. Press Enter to listen again.")]
+        actions: list[Action] = [StopMic(), Print(self._paused_hint())]
         if self.reply_running:
             actions += self._cancel_reply()
         if self._speech_busy():
             actions.append(StopSpeech())
         return actions
+
+    def _paused_hint(self) -> str:
+        if self._enter_pauses:
+            return "Paused. Press Enter to listen again."
+        return "Paused. Use the tray icon to listen again."
 
     def _command(self, text: str) -> list[Action]:
         command = text.strip().lower()
@@ -496,7 +530,7 @@ class ListenMachine:
         if self.paused:
             return []
         self.speaking = True
-        if self._awaiting_confirm or voiced_ms < self._barge_in_ms:
+        if self._awaiting_confirm or not self._vad_barge_in or voiced_ms < self._barge_in_ms:
             return []
         reply_active = self.reply_running and not self._reply_cancelled
         talking = self._speech_busy()

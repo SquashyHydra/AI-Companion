@@ -16,6 +16,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from companion.safety.confirm import Confirmer
+from companion.safety.trust import STATE_CHANGING_TOOLS, TurnTrust, turn_trust
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("companion.audit")
@@ -42,7 +43,8 @@ class Tool:
     func: Callable[..., Any]
     args_model: type[BaseModel]
     timeout_s: float
-    requires_confirmation: bool = False
+    requires_confirmation: bool | Callable[[dict[str, Any]], bool] = False
+    """True to always ask first, or a predicate over the validated arguments that decides per call."""
     worker: threading.Thread | None = None
 
     def schema(self) -> dict[str, Any]:
@@ -60,10 +62,11 @@ class Tool:
 class ToolRegistry:
     """Holds tools, exposes their schemas, and runs calls with timeouts and audit logs."""
 
-    def __init__(self) -> None:
+    def __init__(self, trust: TurnTrust | None = None) -> None:
         self._tools: dict[str, Tool] = {}
         self._lock = threading.Lock()
         self._confirmer: Confirmer | None = None
+        self.trust = trust or turn_trust
 
     @property
     def tools(self) -> list[Tool]:
@@ -79,7 +82,7 @@ class ToolRegistry:
         *,
         name: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
-        requires_confirmation: bool = False,
+        requires_confirmation: bool | Callable[[dict[str, Any]], bool] = False,
     ) -> Any:
         """Decorator that registers a function as a tool. Usable with or without arguments."""
 
@@ -96,7 +99,7 @@ class ToolRegistry:
         *,
         name: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
-        requires_confirmation: bool = False,
+        requires_confirmation: bool | Callable[[dict[str, Any]], bool] = False,
     ) -> Callable[..., Any]:
         tool_name = name or func.__name__
         if not _NAME_RE.match(tool_name):
@@ -166,15 +169,29 @@ class ToolRegistry:
             return "invalid", f"Error: invalid arguments for '{name}': {_summarize(exc)}"
 
         kwargs = {key: getattr(args, key) for key in tool.args_model.model_fields}
-        if (tool.requires_confirmation or confirm_note) and not self._confirmed(
+        if (self._needs_confirmation(tool, kwargs) or confirm_note) and not self._confirmed(
             tool, kwargs, confirm_note
         ):
             return "declined", f"Error: the user did not allow '{name}', so it was not run."
         return self._start(tool, kwargs)
 
+    def _needs_confirmation(self, tool: Tool, kwargs: dict[str, Any]) -> bool:
+        if tool.name in STATE_CHANGING_TOOLS and self.trust.untrusted:
+            return True  # web results were read this turn; ask before changing anything
+        rule = tool.requires_confirmation
+        if not callable(rule):
+            return bool(rule)
+        try:
+            return bool(rule(kwargs))
+        except Exception:  # a broken rule must not skip the question
+            logger.exception("confirmation rule for %s failed; asking", tool.name)
+            return True
+
     def _confirmed(self, tool: Tool, kwargs: dict[str, Any], confirm_note: str | None) -> bool:
         shown = ", ".join(f"{key}={value!r}" for key, value in kwargs.items())
         question = f"Allow the companion to run {tool.name}({shown})?"
+        if self.trust.untrusted and tool.name in STATE_CHANGING_TOOLS:
+            question = f"Web search results were read this turn. {question}"
         if confirm_note:
             question = f"{confirm_note} {question}"
         return self._record_decision(tool.name, question)

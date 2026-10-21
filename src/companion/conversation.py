@@ -25,14 +25,25 @@ from companion.memory.extract import (
 )
 from companion.memory.guards import normalize, sensitive_reason
 from companion.memory.intent import (
+    MAX_FORGET_IDS,
     Intent,
     is_ambiguous,
     is_cancel,
     is_yes,
     looks_like_question,
+    parse_id_spec,
     parse_intent,
 )
-from companion.memory.store import Memory, MemoryStore
+from companion.memory.store import Memory, MemoryStore, memory_line
+from companion.safety.trust import TurnTrust, turn_trust
+from companion.search.policy import (
+    AUTO_GUIDANCE,
+    SEARCH_FILLER,
+    SEARCH_HINT,
+    manual_query,
+    needs_current_info,
+)
+from companion.search.service import WebSearch
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +51,8 @@ PENDING_TIMEOUT_S = 120.0
 """How long a pending "what should I remember?" or yes-or-no question waits for an answer."""
 AUTO_RECALL_SIZE = 5
 """Existing memories shown to the extractor so it can skip duplicates and update contradictions."""
+LIST_SIZE = 20
+"""Most memories printed by a list request. The newest come first."""
 
 Announce = Callable[[str, str | None], None]
 
@@ -59,18 +72,22 @@ def last_user_text(messages: Messages) -> str:
     return ""
 
 
-def forget_question(texts: list[str]) -> str:
-    """Read-back for a forget request: at most three memories are named, the rest are counted."""
+def forget_question(memories: list[Memory]) -> str:
+    """Read-back for a forget request: at most three memories are named, with their numbers."""
 
     def short(text: str) -> str:
         return text if len(text) <= 60 else text[:57] + "..."
 
-    count = len(texts)
-    shown = ", ".join(f'"{short(text)}"' for text in texts[:3])
+    count = len(memories)
+    shown = ", ".join(f'#{memory.id} "{short(memory.text)}"' for memory in memories[:3])
     if count == 1:
         return f"Forget this memory: {shown}? Say yes or no."
     more = f", and {count - 3} more" if count > 3 else ""
     return f"Forget these {count} memories: {shown}{more}? Say yes or no."
+
+
+def _numbers(numbers: list[int]) -> str:
+    return ", ".join(str(number) for number in numbers)
 
 
 @dataclass
@@ -107,10 +124,14 @@ class Conversation:
         announce: Announce | None = None,
         clock: Callable[[], float] = time.monotonic,
         pending_timeout_s: float = PENDING_TIMEOUT_S,
+        search: WebSearch | None = None,
+        trust: TurnTrust | None = None,
     ) -> None:
         self._llm = llm
         self._system_prompt = system_prompt
         self._memory = memory
+        self._search = search
+        self._trust = trust or (search.trust if search is not None else turn_trust)
         self._memory_limit = memory_limit
         self._memory_chars = memory_chars
         self._compactor = compactor
@@ -167,6 +188,10 @@ class Conversation:
         """Run one user message. Memory commands are answered here without the model. Otherwise
         the model answers, and a finished turn may save facts in the background.
         """
+        if self._search is not None:
+            self._search.begin_turn(self._recalled_texts(text))
+        else:
+            self._trust.begin()
         reply = self._command_reply(history, text)
         if reply is not None:
             on_delta(reply)
@@ -179,18 +204,37 @@ class Conversation:
                 self._log.write_turn(text, reply)
             return TurnOutcome(messages=messages, reply=reply, interrupted=False)
 
+        extra: list[str | None] = [self._memory_block(text)]
+        tool_filler: dict[str, str] | None = None
+        search_used = False
+        if self._search is not None and self._search.enabled:
+            extra.append(self._search.date_line())
+            if self._search.auto:
+                extra.append(AUTO_GUIDANCE)
+                if needs_current_info(text):
+                    extra.append(SEARCH_HINT)
+                tool_filler = {"web_search": SEARCH_FILLER}
+            query = manual_query(text)
+            if query is not None:
+                on_delta(SEARCH_FILLER)
+                extra.append(self._search.manual_search(query))
+                search_used = True
+
         outcome = self._llm.stream_turn(
             history,
             text,
             cancel=cancel,
             on_delta=on_delta,
-            extra_system=self._memory_block(text),
+            extra_system="\n\n".join(part for part in extra if part) or None,
             confirm_note=confirm_note,
+            tool_filler=tool_filler,
         )
         if not outcome.interrupted and self._log is not None:
             self._log.write_turn(text, last_reply(outcome.messages))
         if not outcome.interrupted:
-            self._maybe_auto_save(history, text, outcome.messages, low_confidence)
+            self._maybe_auto_save(
+                history, text, outcome.messages, low_confidence, search_used=search_used
+            )
         return outcome
 
     # ----- memory commands -----
@@ -202,16 +246,49 @@ class Conversation:
         """
         if self._memory is None:
             return "Memory is turned off, so there is nothing to forget."
+        ids = parse_id_spec(target)
+        if ids is not None:
+            return self.stage_forget_ids(ids)
         matches = self._memory.find_ids(target)
         if not matches:
             return f'I found no saved memory matching "{target}".'
+        return self._stage_forget(matches)
+
+    def stage_forget_ids(self, ids: list[int]) -> str:
+        """Ask yes or no about the memories with these numbers. Missing numbers are reported."""
+        if self._memory is None:
+            return "Memory is turned off, so there is nothing to forget."
+        if len(ids) > MAX_FORGET_IDS:
+            return f"That names {len(ids)} memories. Forget at most {MAX_FORGET_IDS} at once."
+        found = self._memory.get_many(ids)
+        found_ids = {memory.id for memory in found}
+        missing = [number for number in ids if number not in found_ids]
+        if not found:
+            return f"There is no memory {_numbers(missing)}."
+        note = f"There is no memory {_numbers(missing)}. " if missing else ""
+        return note + self._stage_forget(found)
+
+    def _stage_forget(self, matches: list[Memory]) -> str:
         with self._pending_lock:
             self._pending = _Pending(
                 kind="forget",
                 started=self._clock(),
-                ids=tuple(match.id for match in matches),
+                ids=tuple(memory.id for memory in matches),
             )
-        return forget_question([match.text for match in matches])
+        return forget_question(matches)
+
+    def _list_reply(self) -> str:
+        """Printed by code, never by the model, so the numbers shown are the real ones."""
+        if self._memory is None:
+            return "Memory is turned off, so there is nothing to list."
+        total = self._memory.count()
+        if total == 0:
+            return "I have no saved memories yet."
+        header = f"{total} saved memories:"
+        if total > LIST_SIZE:
+            header = f"{total} saved memories. The newest {LIST_SIZE} are shown:"
+        lines = [memory_line(memory) for memory in self._memory.recent(LIST_SIZE)]
+        return "\n".join([header, *lines])
 
     def _command_reply(self, history: Messages, text: str) -> str | None:
         """The reply for a memory command or a pending answer. None means the model should answer."""
@@ -278,6 +355,10 @@ class Conversation:
             return self._save(previous, previous="")
         if intent.kind == "forget_that":
             return self._forget_latest_auto()
+        if intent.kind == "forget_ids":
+            return self.stage_forget_ids(list(intent.ids))
+        if intent.kind == "list_memories":
+            return self._list_reply()
         return self.stage_forget(intent.text)
 
     def _save(self, content: str, *, previous: str) -> str:
@@ -297,6 +378,9 @@ class Conversation:
         note = content
         if previous and is_ambiguous(content):
             note = self._rewrite(content, previous)
+        existing = self._memory.existing_for(note)
+        if existing is not None:
+            return f"Already saved as memory {existing.id}: {existing.text}"
         memory = self._memory.add(note, source="manual")
         return f"Saved: {memory.text}"
 
@@ -320,10 +404,18 @@ class Conversation:
     # ----- automatic saves -----
 
     def _maybe_auto_save(
-        self, history: Messages, text: str, messages: Messages, low_confidence: bool
+        self,
+        history: Messages,
+        text: str,
+        messages: Messages,
+        low_confidence: bool,
+        *,
+        search_used: bool = False,
     ) -> None:
         if not self._auto_save or self._memory is None or low_confidence:
             return
+        if search_used or self._trust.untrusted:
+            return  # web results are untrusted, so nothing is saved from a turn that searched
         turn = messages[len(history) :]
         if any(message.get("role") == "tool" or message.get("tool_calls") for message in turn):
             return  # tool results are untrusted, so nothing is saved from a tool-using turn
@@ -357,7 +449,7 @@ class Conversation:
                 ),
                 max_tokens=300,
             )
-            facts = parse_extraction(raw, set(known), self._memory_chars)
+            facts = parse_extraction(raw, set(known), self._memory_chars, text)
         except Exception:
             logger.warning("automatic memory extraction failed", exc_info=True)
             return
@@ -376,6 +468,8 @@ class Conversation:
             return
         if normalize(fact.text) in {normalize(value) for value in known.values()}:
             return  # already stored
+        if fact.action != "update" and self._memory.existing_for(fact.text) is not None:
+            return  # already stored under another number
         stored: Memory | None
         if fact.action == "update" and fact.memory_id in known:
             stored = self._memory.update(fact.memory_id, fact.text, source="auto")
@@ -392,6 +486,16 @@ class Conversation:
             self._announce(line, spoken)
         else:
             print(line)
+
+    def _recalled_texts(self, text: str) -> list[str]:
+        """Memories that may be sent to the model this turn. Search queries must not repeat them."""
+        if self._memory is None:
+            return []
+        try:
+            return [memory.text for memory in self._memory.search(text, limit=20)]
+        except Exception:
+            logger.warning("could not read saved memories for the search guard", exc_info=True)
+            return []
 
     def _memory_block(self, text: str) -> str | None:
         if self._memory is None:

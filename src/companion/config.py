@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from companion.files.roots import resolve_root
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
@@ -22,6 +24,7 @@ ENV_OVERRIDES: dict[str, tuple[str, str]] = {
 
 
 DEFAULT_CONTEXT_TOKENS = 8192
+DEFAULT_FILE_ROOTS = ("documents", "desktop", "downloads", "videos", "music")
 
 
 class ConfigError(ValueError):
@@ -82,6 +85,37 @@ class ConversationConfig:
 class ToolsConfig:
     notes_dir: Path
     apps_file: Path
+    file_roots: tuple[Path, ...] = ()
+    """Folders that find_file and open_file may search. Nothing outside them can be opened."""
+
+
+@dataclass(frozen=True)
+class SearchConfig:
+    """Web search. Only the query text is sent, to the provider, over the internet."""
+
+    enabled: bool = False
+    """Off by default in code. When on, the companion may search the web."""
+    auto: bool = True
+    """The companion searches on its own when it needs current or missing information."""
+    max_per_turn: int = 2
+    """Searches allowed in one user turn, manual and automatic together."""
+    timeout_s: float = 8.0
+    results: int = 5
+    """Results per search. Range 1 to 10."""
+    log_file: Path = PROJECT_ROOT / "logs" / "searches.log"
+    """Every query sent is logged here (time, origin, status, query). Results are not logged."""
+
+
+@dataclass(frozen=True)
+class WakeWordConfig:
+    enabled: bool = False
+    """Only hear speech after the wake word. Needs the optional openwakeword package."""
+    model: str = "hey_jarvis"
+    threshold: float = 0.5
+    window_s: float = 8.0
+    """Seconds after the wake word during which speech is heard without repeating it."""
+    follow_up_s: float = 8.0
+    """Seconds after a reply finishes during which speech is heard without the wake word. 0 turns it off."""
 
 
 INPUT_MODES = ("continuous", "push_to_talk", "text")
@@ -96,6 +130,7 @@ class InputConfig:
     """Seconds to wait for a yes or no. No answer in time counts as no."""
     confirm_low_confidence_tools: bool = True
     """Ask for a yes before any tool runs in a turn whose speech was heard with low confidence."""
+    wake_word: WakeWordConfig = WakeWordConfig()
 
 
 @dataclass(frozen=True)
@@ -112,10 +147,12 @@ class AudioConfig:
     min_speech_ms: int = 250
     end_silence_ms: int = 700
     max_utterance_s: float = 30.0
-    barge_in_ms: int = 400
+    barge_in_ms: int = 900
     beam_size: int = 5
     vocabulary: tuple[str, ...] = ()
     include_app_names: bool = True
+    include_file_names: bool = True
+    """Add artist and album folder names from the Music and Videos file roots to speech hints."""
     use_hotwords: bool = False
     low_confidence_logprob: float = -1.0
     save_utterances: bool = False
@@ -170,6 +207,41 @@ class TtsConfig:
 class DisplayConfig:
     show_voice_tags: bool = True
     """Show voice tags such as [laugh] in the terminal. They are never spoken either way."""
+    tray_icon: bool = False
+    """Show a system tray icon in voice mode. Can also be turned on with --tray."""
+
+
+DEFAULT_MEDIA_EXTENSIONS = (
+    ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".wma",
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v",
+)
+DEFAULT_BLOCKED_EXTENSIONS = (
+    ".exe", ".bat", ".cmd", ".com", ".ps1", ".psm1", ".msi", ".msp", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".wsh", ".scr", ".reg", ".lnk", ".hta", ".cpl", ".dll",
+    ".jar", ".msc", ".url", ".py",
+)
+
+
+@dataclass(frozen=True)
+class FilesConfig:
+    """File search, index refresh, and media playback settings."""
+
+    index_refresh_minutes: float = 30.0
+    """How often the file index is rebuilt in the background. 0 turns refreshes off."""
+    confirm_media: bool = False
+    """Ask before playing or opening media. Off by default."""
+    media_extensions: tuple[str, ...] = DEFAULT_MEDIA_EXTENSIONS
+    blocked_extensions: tuple[str, ...] = DEFAULT_BLOCKED_EXTENSIONS
+    """Never opened, even inside a file root. Code and programs are blocked by default."""
+    playlist_max_tracks: int = 200
+
+
+@dataclass(frozen=True)
+class TimersConfig:
+    store_file: Path | None = None
+    """JSON file that keeps running timers and reminders across restarts. None keeps them in memory."""
+    announce_missed: bool = True
+    """Announce, once, a timer that came due while the companion was closed."""
 
 
 @dataclass(frozen=True)
@@ -182,6 +254,11 @@ class AppConfig:
     display: DisplayConfig = DisplayConfig()
     memory: MemoryConfig = MemoryConfig()
     conversation: ConversationConfig = ConversationConfig()
+    files: FilesConfig = FilesConfig()
+    search: SearchConfig = SearchConfig()
+    timers: TimersConfig = TimersConfig()
+    warnings: tuple[str, ...] = ()
+    """Non-fatal problems found while loading, such as deprecated keys. main prints them."""
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> AppConfig:
@@ -200,8 +277,12 @@ def load_config(path: Path | None = None, environ: Mapping[str, str] | None = No
 
     sections = {
         name: _section(raw, name)
-        for name in ("llm", "tools", "audio", "input", "tts", "display", "memory", "conversation")
+        for name in (
+            "llm", "tools", "audio", "input", "tts", "display", "memory", "conversation",
+            "files", "search", "timers",
+        )
     }
+    warnings: list[str] = []
     for env_name, (section, key) in ENV_OVERRIDES.items():
         if env.get(env_name):
             sections[section][key] = env[env_name]
@@ -215,6 +296,8 @@ def load_config(path: Path | None = None, environ: Mapping[str, str] | None = No
 
     notes_dir = _project_path(_str("tools", tools_raw, "notes_dir"))
     apps_file = _project_path(_str("tools", tools_raw, "apps_file"))
+    search = _search_config(tools_raw, sections["search"], warnings)
+    file_roots = _file_roots(tools_raw.get("file_roots", list(DEFAULT_FILE_ROOTS)))
 
     return AppConfig(
         llm=LLMConfig(
@@ -233,13 +316,65 @@ def load_config(path: Path | None = None, environ: Mapping[str, str] | None = No
             connect_retries=_int("llm", llm_raw, "connect_retries", 0, 10),
             retry_delay_s=_float("llm", llm_raw, "retry_delay_s", 0.0, 60.0),
         ),
-        tools=ToolsConfig(notes_dir=notes_dir, apps_file=apps_file),
+        tools=ToolsConfig(
+            notes_dir=notes_dir,
+            apps_file=apps_file,
+            file_roots=file_roots,
+        ),
         audio=_audio_config(sections["audio"]),
         input=_input_config(sections["input"]),
         tts=_tts_config(sections["tts"]),
         display=_display_config(sections["display"]),
         memory=_memory_config(sections["memory"]),
         conversation=_conversation_config(sections["conversation"]),
+        files=_files_config(sections["files"]),
+        search=search,
+        timers=_timers_config(sections["timers"]),
+        warnings=tuple(warnings),
+    )
+
+
+SEARCH_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "auto": True,
+    "max_per_turn": 2,
+    "timeout_s": 8.0,
+    "results": 5,
+}
+
+# Deprecated keys under tools: old name -> new name in the search section.
+LEGACY_SEARCH_KEYS: dict[str, str] = {
+    "web_search_enabled": "enabled",
+    "web_search_max_results": "results",
+}
+
+
+def _search_config(tools_raw: dict[str, Any], search_raw: dict[str, Any], warnings: list[str]) -> SearchConfig:
+    """Read the search section. Deprecated tools.web_search_* keys are used only as fallbacks.
+
+    An old key is used when its new key is not set. New keys always win. Each old key found
+    adds a warning, which main prints at startup.
+    """
+    values: dict[str, Any] = {**SEARCH_DEFAULTS}
+    for old_key, new_key in LEGACY_SEARCH_KEYS.items():
+        if old_key not in tools_raw:
+            continue
+        warnings.append(
+            f"tools.{old_key} is deprecated; rename it to search.{new_key} in config.yaml."
+        )
+        if new_key not in search_raw:
+            values[new_key] = tools_raw[old_key]
+    values.update(search_raw)
+    if not isinstance(values["enabled"], bool):
+        raise ConfigError("search.enabled must be true or false")
+    if not isinstance(values["auto"], bool):
+        raise ConfigError("search.auto must be true or false")
+    return SearchConfig(
+        enabled=values["enabled"],
+        auto=values["auto"],
+        max_per_turn=_int("search", values, "max_per_turn", 1, 10),
+        timeout_s=_float("search", values, "timeout_s", 1.0, 60.0),
+        results=_int("search", values, "results", 1, 10),
     )
 
 
@@ -315,10 +450,11 @@ AUDIO_DEFAULTS: dict[str, Any] = {
     "min_speech_ms": 250,
     "end_silence_ms": 700,
     "max_utterance_s": 30,
-    "barge_in_ms": 400,
+    "barge_in_ms": 900,
     "beam_size": 5,
     "vocabulary": [],
     "include_app_names": True,
+    "include_file_names": True,
     "use_hotwords": False,
     "low_confidence_logprob": -1.0,
     "save_utterances": False,
@@ -390,7 +526,10 @@ def _display_config(raw: dict[str, Any]) -> DisplayConfig:
     show = raw.get("show_voice_tags", True)
     if not isinstance(show, bool):
         raise ConfigError("display.show_voice_tags must be true or false")
-    return DisplayConfig(show_voice_tags=show)
+    tray = raw.get("tray_icon", False)
+    if not isinstance(tray, bool):
+        raise ConfigError("display.tray_icon must be true or false")
+    return DisplayConfig(show_voice_tags=show, tray_icon=tray)
 
 
 def _input_config(raw: dict[str, Any]) -> InputConfig:
@@ -401,7 +540,75 @@ def _input_config(raw: dict[str, Any]) -> InputConfig:
         mode=_choice("input", values, "mode", INPUT_MODES),
         confirm_timeout_s=_float("input", values, "confirm_timeout_s", 5.0, 300.0),
         confirm_low_confidence_tools=values["confirm_low_confidence_tools"],
+        wake_word=_wake_word_config(values.get("wake_word") or {}),
     )
+
+
+def _wake_word_config(raw: dict[str, Any]) -> WakeWordConfig:
+    values = {**WakeWordConfig().__dict__, **raw}
+    if not isinstance(values["enabled"], bool):
+        raise ConfigError("input.wake_word.enabled must be true or false")
+    model = values["model"]
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError("input.wake_word.model must be a model name such as hey_jarvis")
+    return WakeWordConfig(
+        enabled=values["enabled"],
+        model=model.strip(),
+        threshold=_float("input.wake_word", values, "threshold", 0.05, 0.99),
+        window_s=_float("input.wake_word", values, "window_s", 2.0, 60.0),
+        follow_up_s=_float("input.wake_word", values, "follow_up_s", 0.0, 60.0),
+    )
+
+
+def _timers_config(raw: dict[str, Any]) -> TimersConfig:
+    values = {"store_file": "", "announce_missed": True, **raw}
+    if not isinstance(values["announce_missed"], bool):
+        raise ConfigError("timers.announce_missed must be true or false")
+    store = values["store_file"]
+    store_file = None if store in (None, "") else _project_path(str(store).strip())
+    return TimersConfig(store_file=store_file, announce_missed=values["announce_missed"])
+
+
+def _file_roots(raw: Any) -> tuple[Path, ...]:
+    if not isinstance(raw, list) or not all(isinstance(item, str) and item.strip() for item in raw):
+        raise ConfigError("tools.file_roots must be a list of folder paths or shortcut names")
+    return tuple(resolve_root(item, PROJECT_ROOT) for item in raw)
+
+
+FILES_DEFAULTS: dict[str, Any] = {
+    "index_refresh_minutes": 30.0,
+    "confirm_media": False,
+    "media_extensions": list(DEFAULT_MEDIA_EXTENSIONS),
+    "blocked_extensions": list(DEFAULT_BLOCKED_EXTENSIONS),
+    "playlist_max_tracks": 200,
+}
+
+
+def _files_config(raw: dict[str, Any]) -> FilesConfig:
+    values = {**FILES_DEFAULTS, **raw}
+    if not isinstance(values["confirm_media"], bool):
+        raise ConfigError("files.confirm_media must be true or false")
+    return FilesConfig(
+        index_refresh_minutes=_float("files", values, "index_refresh_minutes", 0.0, 1440.0),
+        confirm_media=values["confirm_media"],
+        media_extensions=_extensions("files.media_extensions", values["media_extensions"]),
+        blocked_extensions=_extensions("files.blocked_extensions", values["blocked_extensions"]),
+        playlist_max_tracks=_int("files", values, "playlist_max_tracks", 1, 1000),
+    )
+
+
+def _extensions(name: str, raw: Any) -> tuple[str, ...]:
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ConfigError(f"{name} must be a list of file extensions such as .mp3")
+    found: list[str] = []
+    for item in raw:
+        ext = item.strip().lower()
+        if not ext:
+            continue
+        ext = ext if ext.startswith(".") else "." + ext
+        if ext not in found:
+            found.append(ext)
+    return tuple(found)
 
 
 def _audio_config(raw: dict[str, Any]) -> AudioConfig:
@@ -419,7 +626,7 @@ def _audio_config(raw: dict[str, Any]) -> AudioConfig:
     vocabulary = values["vocabulary"]
     if not isinstance(vocabulary, list) or not all(isinstance(term, str) for term in vocabulary):
         raise ConfigError("audio.vocabulary must be a list of words or phrases")
-    for key in ("include_app_names", "use_hotwords", "save_utterances", "speak_replies"):
+    for key in ("include_app_names", "include_file_names", "use_hotwords", "save_utterances", "speak_replies"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"audio.{key} must be true or false")
 
@@ -440,6 +647,7 @@ def _audio_config(raw: dict[str, Any]) -> AudioConfig:
         beam_size=_int("audio", values, "beam_size", 1, 10),
         vocabulary=tuple(term.strip() for term in vocabulary if term.strip()),
         include_app_names=values["include_app_names"],
+        include_file_names=values["include_file_names"],
         use_hotwords=values["use_hotwords"],
         low_confidence_logprob=_float("audio", values, "low_confidence_logprob", -10.0, 0.0),
         save_utterances=values["save_utterances"],

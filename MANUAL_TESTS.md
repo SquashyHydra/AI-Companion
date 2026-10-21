@@ -160,21 +160,47 @@ Setup: LM Studio running with the model loaded. Start the companion in text mode
 - **Persona:** edit [data/persona.md](data/persona.md) to a new name, type `/new`, and ask the companion its name. Expected: it uses the new persona. Restore the file afterward.
 - **Remember and recall:** say "remember that my dog is called Biscuit". Expected: a confirmation and a saved memory. Start `/new`, then ask "what is my dog called?". Expected: the answer names Biscuit.
 - **Secret refusal:** say "remember my password is hunter2". Expected: refused; nothing is saved.
-- **List and forget:** ask to list memories. Ask to forget "dog". Expected: a confirmation prompt; answer no, then yes; the memory is gone.
+- **List and forget:** say "list my memories". Expected: a numbered list printed by the app, with the count in the header. Ask to forget "dog". Expected: a confirmation prompt; answer no, then yes; the memory is gone.
 - **Status:** type `/status`. Expected: model, context use, saved memory count, and the log path after the first reply.
 - **Log:** check that a file in `logs/conversations/` contains your turns and the replies.
 - **Server down:** stop LM Studio's server and send a message. Expected: a short "cannot reach" message after a few seconds, no crash. Restart the server; the next message works and the earlier history is still there.
 - **Long conversation:** lower `llm.compact_at` to 0.3 for this check. Send several long messages. Expected: no error; `/status` still works; the reply quality stays reasonable.
 - **Voice:** in continuous mode, say the remember and recall phrases. Expected: the same results as in text.
-- **Remember in two messages:** send "remember" alone. Expected: the reply asks what to remember. Send "my car is a blue Honda" next. Expected: it is saved, and the reply confirms only after the save. Check with `list_memories` that the text is there.
+- **Remember in two messages:** send "remember" alone. Expected: the reply asks what to remember. Send "my car is a blue Honda" next. Expected: it is saved, and the reply confirms only after the save. Check with "list my memories" that the text is there.
 - **Remember the previous message:** send "my sister lives in Leeds", then "remember this". Expected: the previous message is saved.
-- **Auto-save:** with `memory.auto_save: true`, state a fact about yourself ("I have two cats") and do not ask to remember it. Expected: `list_memories` shows it with source `auto`. Set `memory.auto_save: false`, repeat, and expect nothing new to be saved.
+- **Auto-save:** with `memory.auto_save: true`, state a fact about yourself ("I have two cats") and do not ask to remember it. Expected: "list my memories" shows it, and the database row has source `auto`. Set `memory.auto_save: false`, repeat, and expect nothing new to be saved.
 - **Auto-save skips questions:** ask "do I have any cats?". Expected: nothing new is saved.
+- **Duplicate remember:** send "remember my dog is called Biscuit" twice, the second time with different capitals or a final period. Expected: the second reply says "Already saved as memory N", and "list my memories" shows one copy.
+- **Forget by number:** with at least three memories listed, say "forget 2-3". Expected: a read-back naming those numbers and asking yes or no. Say "no"; nothing is deleted. Say "forget 99". Expected: "There is no memory 99."
+- **Admin dedupe (dry run):** run `python -m companion.memory_admin dedupe`. Expected: it lists groups or says there are no duplicates, and deletes nothing. Run it again with `--apply` only after a backup has been reviewed; a file appears in `data/memory/backups/`.
 - **Forget that:** after an auto-save, say "forget that". Expected: the latest auto-saved memory is deleted at once, with no read-back.
 - **Forget read-back:** say "forget cats". Expected: the reply reads back the matching text and asks yes or no. Answer "yes" to delete it; repeat and answer "no" to keep it. Any other reply is handled as a new message, and nothing is deleted.
 - **Synonym recall:** save "I work as a nurse in Leeds". In a new conversation (`/new`), ask "what is my job?". Expected: the nurse memory is recalled through the semantic match, even though the words "job" and "nurse" do not match.
 - **Embeddings off:** set `memory.embeddings: false`, restart, and repeat the synonym check. Expected: no semantic match; keyword recall still works.
 - **Embedding model missing:** set `memory.embedding_cache` to an empty folder without internet. Expected: a notice says the model is unavailable, and keyword recall still works.
+
+## 13. Polish: timers, media, files, tray, startup, wake word (Phase 6)
+
+Setup: `pip install -r requirements.txt`. For voice checks, use `input.mode: continuous` and a working microphone.
+
+- **Timer:** say or type "set a timer for 0.5 minutes called tea". Expected: a confirmation with a timer number. After about 30 seconds, a `* Timer done: tea.` notice appears before the next prompt (text) or is spoken (voice).
+- **Cancel:** "list my timers", then "cancel timer <number>". Expected: the listing shows the timer, and the cancel confirms it. The timer does not fire.
+- **Reminder:** "remind me at a time two minutes from now to stretch". Expected: a reminder set for that clock time. Use a short gap to check it fires.
+- **Volume:** say "turn the volume up". Expected: the system volume rises by about 4 percent. "Mute" toggles mute. Undo both afterward.
+- **Media:** with music or a video playing, say "pause". Expected: playback toggles. Try next and previous.
+- **Find file:** ask "find my file called <part of a real file name>" for a file in Documents. Expected: the path is listed.
+- **Find folder (Music):** ask "find my music folder". Expected: the first result is your Music folder, marked "(folder)".
+- **Open folder:** ask "open my music folder". Expected: a confirmation prompt. Answer yes; Explorer opens the Music folder. Answer no on another try; nothing opens.
+- **Open file:** ask to open that file. Expected: a confirmation prompt. Answer no; nothing opens. Repeat and answer yes; the file opens in its default program.
+- **Refused file types:** ask to open an `.exe` or `.bat` file in your roots. Expected: the confirmation prompt appears, then after you answer yes the call is refused with the code-file message. Nothing runs.
+- **Outside roots:** ask to open a file on another drive by full path. Expected: refused as outside your file folders.
+- **Web search off:** with the default config, ask to search the web. Expected: "Web search is turned off".
+- **Web search on:** set `tools.web_search_enabled: true`, restart, search "python release notes". Expected: numbered titles with links. Turn it back off after the test.
+- **Tray:** set `display.tray_icon: true`, start voice mode, and check that the icon appears in the notification area. Right-click: "Open logs folder" opens `logs`. "Quit" stops voice mode and the process exits with no hang. Check `logs/companion.log` for a clean shutdown.
+- **Startup on sign-in:** run `python -m companion.startup --enable`, then `--status`. Expected: enabled. Sign out and back in (or run the stored command from the Run key by hand). Expected: no console window, the tray icon appears, and `logs/startup-console.log` has no traceback. Run `--disable`, then `--status` shows disabled.
+- **Wake word:** set `input.wake_word.enabled: true`, start voice mode, and wait for "Wake word on". Say nothing and speak a request: nothing should happen. Say "hey jarvis", pause, then ask for the time. Expected: the request is answered. Wait longer than `window_s`, then speak without the wake word: nothing should happen.
+- **Wake word false triggers:** talk normally for a few minutes with the wake word enabled. Expected: no unexpected replies. If there are some, raise `threshold` to 0.6 and retest.
+- **Tool log:** check that `logs/tool_calls.jsonl` has one record per tool call above, with status ok, declined, or failed as expected.
 
 ## Other modes (regression)
 

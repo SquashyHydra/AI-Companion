@@ -1,4 +1,8 @@
-"""Memory tools: remember, recall, list_memories, and forget."""
+"""Memory tools: remember, recall, and forget.
+
+Listing memories is done in code (see the conversation module), not by a tool, so the model never
+prints numbers or lists it made up.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,7 @@ import threading
 from collections.abc import Callable
 
 from companion.config import get_config
-from companion.memory.store import Memory, MemoryStore, clean_text
+from companion.memory.store import Memory, MemoryStore, clean_text, memory_line
 from companion.safety.secrets import secret_reason
 from companion.tools.registry import tool
 
@@ -42,12 +46,8 @@ def active_store() -> MemoryStore | None:
         return _store
 
 
-def _memories(count: int) -> str:
-    return f"{count} memory" if count == 1 else f"{count} memories"
-
-
 def _line(memory: Memory) -> str:
-    return f"[{memory.id}] ({memory.source}) {memory.text}"
+    return memory_line(memory)
 
 
 @tool
@@ -72,6 +72,9 @@ def remember(fact: str) -> str:
     reason = secret_reason(text)
     if reason:
         return f"Error: not saved because {reason}. Memory is for facts, not secrets."
+    existing = store.existing_for(text)
+    if existing is not None:
+        return f"Already saved as memory {existing.id}: {existing.text}"
     saved = store.add(text)
     return f"Saved memory {saved.id}: {saved.text}"
 
@@ -95,31 +98,14 @@ def recall(query: str, limit: int = 5) -> str:
 
 
 @tool
-def list_memories(limit: int = 20) -> str:
-    """List the newest saved memories with their numbers.
-
-    Args:
-        limit: How many memories to list (1 to 50).
-    """
-    store = active_store()
-    if store is None:
-        return DISABLED
-    limit = max(1, min(int(limit), 50))
-    memories = store.recent(limit)
-    if not memories:
-        return "No saved memories yet."
-    return "\n".join(_line(memory) for memory in memories)
-
-
-@tool
 def forget(target: str) -> str:
     """Forget saved memories. Nothing is deleted until the user answers yes.
 
     This asks the user to confirm. It does not delete anything by itself.
 
     Args:
-        target: A memory number such as 3, the word 'all' to forget everything, or a few words
-            that appear in the memories to forget.
+        target: A memory number such as 3 or 2-4, the word 'all' to forget everything, or a few
+            words that appear in the memories to forget.
     """
     with _lock:
         stager = _forget_stager

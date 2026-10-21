@@ -163,13 +163,21 @@ In-chat commands: `/tools` lists tools (tools that ask first are marked), `/mics
 ## Conversation, persona, and memory
 
 - **Persona:** the personality is in [data/persona.md](data/persona.md). It is read at the start of each conversation (`/new` picks up edits). A missing or empty file uses a built-in default. The safety rules in the system prompt always come first.
-- **Long-term memory:** facts are stored in `data/memory/memories.sqlite`. The tools `remember`, `recall`, `list_memories`, and `forget` manage them.
+- **Long-term memory:** facts are stored in `data/memory/memories.sqlite`. The tools `remember`, `recall`, and `forget` manage them. Say "list my memories" to see the numbered list. The app prints that list itself, so the numbers are always real.
+  - Duplicates: saving text that matches an existing memory (ignoring case and punctuation) does not add a second copy. The reply names the existing memory number instead. A unique index in the database enforces this.
+  - Forget by number: "forget 3", "remove memory 3", "can you delete memories 2-4", and "forget twenty three" all work. Numbers that do not exist are reported. Up to 200 numbers at once, and the answer must still be yes or no. "Remove" and "delete" only count as memory commands when the message names a memory or gives numbers, so "remove the milk from my list" is left to the model.
+  - Forget by words: matches any memory that contains any of the words, so read the read-back carefully before saying yes.
   - Remember flows: "remember that ..." saves at once. "remember this" saves the previous message. A bare "remember" followed by the content in the next message also saves. Vague notes such as "it is at 3" are rewritten from the earlier message when one is available. Saves and forgets are decided by the app, not the model, so the model cannot claim a save that did not happen.
   - `forget <target>` reads back the matching texts and needs an exact yes or no. "Forget that" deletes the latest automatically saved memory immediately, with no read-back.
   - `remember` refuses text that looks like a password, key, or token.
-  - Auto-save (`memory.auto_save`, default true) lets the companion save facts you state about yourself after a turn. It is skipped for tool turns, low-confidence speech, and remember or forget messages. Set `memory.announce_auto: true` to hear a short notice when it saves. A later contradiction can overwrite an earlier memory.
+  - Auto-save (`memory.auto_save`, default true) lets the companion save facts you state about yourself after a turn. It is skipped for tool turns, low-confidence speech, and remember or forget messages. Each saved fact must quote your own words, so facts the model invents are dropped. Set `memory.announce_auto: true` to hear a short notice when it saves. A later contradiction can overwrite an earlier memory.
   - Recall is hybrid: keyword matches (SQLite FTS5, Porter stemming) plus semantic matches from a small CPU embedding model (`BAAI/bge-small-en-v1.5` through fastembed). Settings are under `memory:`: `embeddings` (true or false), `embedding_model`, `embedding_cache` (default `data/models`), and `semantic_min_score` (default 0.55, the cosine cutoff). The first run downloads the model and needs internet. If the model cannot load, the app prints a notice and uses keyword recall only.
   - Measured cosine scores with this model are close together for short queries (for example, "my job" against "User works as a nurse in Leeds." scored 0.572, and an unrelated memory reached 0.594). Tune `semantic_min_score` if you see missed or extra recalls.
+- **Memory admin CLI:** run from the project folder with `$env:PYTHONPATH = "src"`:
+  - `python -m companion.memory_admin list` prints every saved memory with its number.
+  - `python -m companion.memory_admin dedupe` shows which exact duplicates would be removed (the oldest copy of each is kept). Add `--apply` to remove them.
+  - `python -m companion.memory_admin forget 3-5` shows what would be forgotten. Add `--apply` to delete. Numbers use the same forms as chat.
+  - Every `--apply` first writes a backup to `data/memory/backups/memories-<timestamp>.sqlite`. Commands exit with code 2 on a bad number spec.
 - **Long conversations:** when history passes `llm.compact_at` of the context window, older turns are summarized in the background by one extra LLM call. The most recent `llm.keep_recent_turns` turns are kept as they are. The window is read from LM Studio, or set `llm.context_tokens`.
 - **Errors:** if the LLM server is unreachable, the companion retries `llm.connect_retries` times with a growing delay, then reports the problem and keeps the conversation intact. Tool results longer than `llm.max_tool_result_chars` are shortened before the model sees them.
 - **Conversation log:** each conversation is saved as plain text under `logs/conversations/`. Set `conversation.log_enabled: false` to turn this off.
@@ -177,6 +185,57 @@ In-chat commands: `/tools` lists tools (tools that ask first are marked), `/mics
 See [MANUAL_TESTS.md](MANUAL_TESTS.md) for the hands-on checks to run after changes to speech input.
 
 On startup the companion loads plugins from `plugins/` and prints which ones loaded or were skipped.
+
+## Phase 6: more tools, tray, startup, wake word
+
+Install the new dependencies with `pip install -r requirements.txt` (adds `pystray`, `pillow`, and `openwakeword`).
+
+New tools:
+
+- **Timers:** `set_timer` (0.1 to 1440 minutes), `set_reminder` (24-hour `HH:MM`, today or tomorrow), `list_timers`, `cancel_timer`. They are saved to `timers.store_file` (`data/timers.json` in the shipped config), so they survive a restart. If `timers.announce_missed` is `true`, timers that finished while the companion was closed are reported at startup. When one finishes, a notice appears before the next prompt in text chat, and it is spoken in voice mode.
+- **Volume and media:** `volume` (`up`, `down`, `mute`; each step is about 2 percent, relative only) and `media` (`play_pause`, `next`, `previous`, `stop`). These send the same key presses as a keyboard, so they work in any app.
+- **File search:** `find_file` searches the folders in `tools.file_roots` (documents, desktop, downloads, videos, and music by default). It lists folders as well as files, and folder names and shallow matches come first, so "music" finds your Music folder. Each root has its own scan budget, so a large folder cannot hide the others. Hidden folders and `node_modules`, `venv`, `AppData` are skipped. `open_file` asks first and can open a file or folder inside those folders. It refuses anything outside them and code types (`.exe`, `.bat`, `.ps1`, `.lnk`, and similar).
+- **Web search:** `web_search` is configured in the `search:` section of `config.yaml`:
+  - `enabled` (default `false` in code; `true` in the shipped `config.yaml`): turns web search on or off.
+  - `auto` (default `true`): the companion may search on its own when it needs current or missing information. Set `false` to allow searches only when you ask ("search for X", "look up X", "google X", "search the web for X").
+  - `max_per_turn` (default 2): searches allowed for one question.
+  - `timeout_s` (default 8): seconds to wait for each search.
+  - `results` (default 5): results per search.
+  - Rate-limited searches are retried twice with a short wait. If that fails, the companion says so and does not guess.
+  - Results are printed with titles and URLs. URLs are never read aloud. Results are treated as untrusted: after a search, state-changing tools (opening files or apps, volume, timers, memory, clearing notes) ask for confirmation for the rest of that turn. Saving notes and media playback do not ask.
+  - **Privacy:** only the search text is sent to DuckDuckGo over the internet. A search is refused if it contains a secret or repeats a saved memory. Each search is printed as `[searching: ...]` and logged to `logs/searches.log`. This conflicts with the fully local goal, so set `search.enabled: false` if that matters to you.
+  - **Deprecated keys:** `tools.web_search_enabled` maps to `search.enabled`, and `tools.web_search_max_results` maps to `search.results`. The old keys are used only when the new key is absent, and a startup warning names the replacement. If both are set, the `search.*` key wins.
+
+Tray icon: set `display.tray_icon: true`, or start with `python -m companion --tray`. The menu shows a status line (`Status: listening` or `Status: paused`), a "Pause listening" or "Resume listening" item, "Open logs folder", and "Quit". Pause and Resume do the same as Enter in the console. Quit ends voice mode the same way Ctrl+C does.
+
+Wake word (voice mode only): set `input.wake_word.enabled: true`. Say the wake word first, then your request within `input.wake_word.window_s` seconds (default 8).
+
+- The model is `hey_jarvis` by default. The first run downloads it once into the openwakeword package folder, which needs internet. Manual download: `python -c "from openwakeword.utils import download_models; download_models(['hey_jarvis'])"`.
+- `threshold` (default 0.5) trades missed triggers against false triggers.
+- Limits: while the wake gate is closed, no speech events are produced, so barge-in does not work while waiting for the wake word. Audio from just before the wake word may clip part of the phrase.
+
+### Follow-up, barge-in, and tuning tools
+
+These apply in voice mode.
+
+- **Follow-up (wake word enabled):** after a reply finishes, the microphone stays open for `input.wake_word.follow_up_s` seconds (default 8; `0` turns it off). You can ask the next question without saying the wake word again. The window stays open while you keep talking.
+- **Barge-in with headphones:** speaking over a reply for `audio.barge_in_ms` (default 900 ms) stops the reply and starts listening to you. The wake word also stops a reply at once.
+- **Barge-in with speakers:** the microphone does not send audio to the speech detector while the companion talks, so the reply is not cut off by its own voice. The wake word still works during playback and is the only way to interrupt.
+- **Diagnose the wake word:** `python -m companion.diagnose_wakeword --seconds 10` listens for the given time, counts triggers, and prints the best score. If nothing triggers but the best score is at least 0.2, it suggests a lower threshold.
+- **Benchmark file search:** `python -m companion.bench_fuzzy --entries 50000` builds a synthetic index and times exact, substring, fuzzy, and miss queries. It also reports the cost of one fuzzy word lookup. Without rapidfuzz installed, the fuzzy lookup runs on difflib, which is the slowest step at large sizes.
+
+Start at Windows sign-in:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m companion.startup --enable    # register the sign-in entry
+python -m companion.startup --status    # show whether it is set
+python -m companion.startup --disable   # remove it
+```
+
+The entry runs [scripts/launch_companion.pyw](scripts/launch_companion.pyw) with `pythonw.exe`, which has no console window. Its output goes to `logs/startup-console.log`. The startup launch runs voice mode only, so set `input.mode: continuous` first. In text mode the chat reads from an empty input and exits.
+
+Known limits: volume changes are relative only, and web search needs internet. The tray, the sign-in launch, and the wake word on real speech are checked by hand in [MANUAL_TESTS.md](MANUAL_TESTS.md) (section 13), not by the automated tests.
 
 ## Configuration
 

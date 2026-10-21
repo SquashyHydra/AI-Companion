@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -144,6 +144,7 @@ class LLMClient:
         *,
         extra_system: str | None = None,
         confirm_note: str | None = None,
+        tool_filler: Mapping[str, str] | None = None,
     ) -> TurnOutcome:
         """Run one user turn. The input list is not modified.
 
@@ -153,6 +154,8 @@ class LLMClient:
 
         extra_system is sent for this turn only (for example, memories) and is not stored in the
         returned history. confirm_note is shown in front of tool confirmation questions.
+        tool_filler maps a tool name to a short line spoken before that tool runs, but only when
+        the model has not spoken yet this turn (for example, "Let me look that up.").
         """
         cancel = cancel or threading.Event()
         history: Messages = [*messages, {"role": "user", "content": user_text}]
@@ -193,6 +196,9 @@ class LLMClient:
                 }
             )
             for call in calls:
+                filler = tool_filler.get(call["name"]) if tool_filler else None
+                if filler and not emitted[0]:
+                    watched(filler)
                 result = self._registry.call(
                     call["name"], call["arguments"], confirm_note=confirm_note
                 ).text

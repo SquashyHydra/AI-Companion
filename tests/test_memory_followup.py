@@ -18,7 +18,8 @@ from companion.memory.embedder import build_embedder
 from companion.memory.store import MemoryStore
 
 EXTRACT_NURSE = (
-    '{"facts": [{"action": "add", "id": null, "text": "User works as a nurse in Leeds."}]}'
+    '{"facts": [{"action": "add", "id": null, "text": "User works as a nurse in Leeds.", '
+    '"quote": "I work as a nurse in Leeds"}]}'
 )
 
 
@@ -356,7 +357,10 @@ def test_auto_save_does_not_duplicate_a_stored_fact(tmp_path):
 def test_auto_save_updates_a_contradicted_memory(tmp_path):
     store = _store(tmp_path)
     old = store.add("User lives in Leeds.")
-    update = '{"facts": [{"action": "update", "id": %d, "text": "User lives in York."}]}' % old.id
+    update = (
+        '{"facts": [{"action": "update", "id": %d, "text": "User lives in York.", '
+        '"quote": "I live in York now"}]}' % old.id
+    )
     llm = FakeLLM(complete_reply=update)
     conv = _conv(tmp_path, llm, store, auto=True)
 
@@ -374,7 +378,8 @@ def test_auto_save_skips_sensitive_facts(tmp_path):
     store = _store(tmp_path)
     secret = (
         '{"facts": [{"action": "add", "id": null, '
-        '"text": "User password is hunter22 for the bank"}]}'
+        '"text": "User password is hunter22 for the bank", '
+        '"quote": "my bank password is hunter22"}]}'
     )
     conv = _conv(tmp_path, FakeLLM(complete_reply=secret), store, auto=True)
 

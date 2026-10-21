@@ -33,7 +33,7 @@ conversation:
   log_enabled: true
   log_dir: logs/conversations
 
-# Long-term memory: remember, recall, list_memories, and forget tools.
+# Long-term memory: remember, recall, and forget tools. Listing is done by the app ("list my memories").
 memory:
   enabled: true
   db_path: data/memory/memories.sqlite
@@ -58,6 +58,48 @@ tools:
   notes_dir: data/notes
   # JSON allowlist of apps the companion may open (friendly name -> path or steam:// URL).
   apps_file: data/apps.json
+  # Folders that find_file, open_file, and play_media may use. Nothing outside these folders can be opened.
+  # Shortcuts (documents, desktop, downloads, videos, music) follow your Windows folder settings, such as OneDrive.
+  # Full paths also work. A missing folder is reported at startup with a suggestion.
+  file_roots:
+    - documents
+    - desktop
+    - downloads
+    - videos
+    - music
+
+# Web search. Only the query text is sent, to DuckDuckGo, over the internet. Each query is logged to logs/searches.log.
+search:
+  # Turn web search on or off.
+  enabled: true
+  # The companion searches on its own when it needs current or missing information.
+  # "search for X" and "look up X" always search, even when this is false.
+  auto: true
+  # Searches allowed in one user turn. Range 1 to 10.
+  max_per_turn: 2
+  # Seconds to wait for each search. Range 1 to 60.
+  timeout_s: 8
+  # Results per search. Range 1 to 10.
+  results: 5
+
+timers:
+  # JSON file that keeps running timers and reminders across restarts. Empty keeps them in memory only.
+  store_file: data/timers.json
+  # A timer that came due while the companion was closed is announced once at startup.
+  announce_missed: true
+
+files:
+  # How often the file index is rebuilt in the background, in minutes. 0 turns refreshes off.
+  # Use rescan_files to rebuild it on demand.
+  index_refresh_minutes: 30
+  # Ask before playing or opening music and video. Folders and documents always ask.
+  confirm_media: false
+  # Extensions play_media and open_file treat as media.
+  media_extensions: [.mp3, .flac, .wav, .m4a, .aac, .ogg, .opus, .wma, .mp4, .mkv, .avi, .mov, .webm, .m4v]
+  # Never opened, even inside a file root. Code and programs are blocked by default.
+  blocked_extensions: [.exe, .bat, .cmd, .com, .ps1, .psm1, .msi, .msp, .vbs, .vbe, .js, .jse, .wsf, .wsh, .scr, .reg, .lnk, .hta, .cpl, .dll, .jar, .msc, .url, .py]
+  # Most tracks a playlist from one folder will load. Range 1 to 1000.
+  playlist_max_tracks: 200
 
 input:
   # continuous: always listening, hands-free, with barge-in.
@@ -66,6 +108,17 @@ input:
   mode: continuous
   # Seconds to answer a confirmation (yes or no). No answer counts as no. Range 5 to 300.
   confirm_timeout_s: 30
+  # Optional wake word for continuous mode. Needs: pip install openwakeword (downloads a model once).
+  wake_word:
+    enabled: false
+    # Name of an openWakeWord model, for example hey_jarvis.
+    model: hey_jarvis
+    # Detection score from 0.05 to 0.99. Higher means fewer false triggers.
+    threshold: 0.5
+    # Seconds after the wake word during which speech is heard without repeating it. Range 2 to 60.
+    window_s: 8
+    # Seconds after a reply finishes when you can speak again without the wake word. 0 turns it off.
+    follow_up_s: 8
 
 audio:
   # Speech input. Set to false for text-only chat (same as input.mode: text).
@@ -93,11 +146,11 @@ audio:
   # Speech shorter than this is treated as a cough or click and ignored.
   min_speech_ms: 250
   # Silence that ends an utterance. Lower is faster but cuts off pauses mid-sentence.
-  end_silence_ms: 700
+  end_silence_ms: 900
   # Longest single utterance before it is cut and sent.
-  max_utterance_s: 30
+  max_utterance_s: 45
   # Speech for this long while the companion is talking or thinking interrupts it.
-  barge_in_ms: 400
+  barge_in_ms: 900
 
   # Transcription settings.
   # Beam search width. Higher is slower and sometimes more accurate.
@@ -106,6 +159,8 @@ audio:
   vocabulary: []
   # Also add the names in data/apps.json to the vocabulary.
   include_app_names: true
+  # Also add artist and album folder names from your Music and Videos folders (from the file index).
+  include_file_names: true
   # Use the vocabulary as hotwords too. Can make Whisper over-insist on these words.
   use_hotwords: false
   # Average log-probability below this marks a transcript as low confidence.
@@ -167,3 +222,5 @@ tts:
 display:
   # true: show voice tags such as [laugh] on screen. false: hide the tags that the voice renders.
   show_voice_tags: true
+  # true: show a system tray icon in voice mode (Quit, open logs). Same as starting with --tray.
+  tray_icon: true
